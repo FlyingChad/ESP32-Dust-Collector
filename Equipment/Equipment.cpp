@@ -1,4 +1,5 @@
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <WiFi.h>
 #include <LocalConfig.h>
 
@@ -51,6 +52,10 @@ const size_t EQUIPMENT_COUNT = sizeof(equipment) / sizeof(equipment[0]);
 //
 
 const unsigned long HEARTBEAT_INTERVAL_MS = 1000;
+constexpr uint8_t FIRST_ESPNOW_CHANNEL = 1;
+constexpr uint8_t LAST_ESPNOW_CHANNEL = 11;
+constexpr unsigned long CHANNEL_SCAN_INTERVAL_MS = 75;
+constexpr uint8_t SEND_FAILURES_BEFORE_RESCAN = 3;
 
 
 // ============================================================
@@ -82,6 +87,14 @@ struct_message myData;
 // ============================================================
 
 esp_now_peer_info_t peerInfo = {};
+volatile bool sendResultReady = false;
+volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
+bool sendInProgress = false;
+bool masterFound = false;
+uint8_t scanChannel = FIRST_ESPNOW_CHANNEL;
+uint8_t activeChannel = FIRST_ESPNOW_CHANNEL;
+uint8_t consecutiveSendFailures = 0;
+unsigned long lastChannelScanTime = 0;
 
 
 // ============================================================
@@ -91,23 +104,8 @@ esp_now_peer_info_t peerInfo = {};
 void OnDataSent(
     const uint8_t *macAddress,
     esp_now_send_status_t status) {
-
-  // Debugging can be enabled here if desired.
-
-  /*
-  Serial.print("Packet delivery: ");
-
-  if (status == ESP_NOW_SEND_SUCCESS) {
-
-    Serial.println("SUCCESS");
-
-  }
-  else {
-
-    Serial.println("FAILED");
-
-  }
-  */
+  lastSendStatus = status;
+  sendResultReady = true;
 }
 
 
@@ -115,7 +113,16 @@ void OnDataSent(
 // SEND CURRENT MACHINE STATE
 // ============================================================
 
-void sendMachineState(const EquipmentInput &input) {
+void sendMachineState(const EquipmentInput &input, uint8_t channel) {
+  esp_err_t channelResult = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  if (channelResult != ESP_OK) {
+    Serial.printf("Failed to select ESP-NOW channel %u: %d\n",
+                  channel, channelResult);
+    lastSendStatus = ESP_NOW_SEND_FAIL;
+    sendResultReady = true;
+    sendInProgress = true;
+    return;
+  }
 
   // Safely copy device name
 
@@ -141,44 +148,52 @@ void sendMachineState(const EquipmentInput &input) {
   // SEND ESP-NOW PACKET
   // ----------------------------------------------------------
 
-  esp_err_t result =
-      esp_now_send(
-
-          MASTER_MAC,
-
-          (uint8_t *)&myData,
-
-          sizeof(myData)
-      );
-
-
-  // ----------------------------------------------------------
-  // OPTIONAL DEBUGGING
-  // ----------------------------------------------------------
-
-  /*
-  Serial.print("Device: ");
-
-  Serial.print(myData.device);
-
-  Serial.print(" | Request: ");
-
-  Serial.print(myData.request);
-
-  Serial.print(" | Local send: ");
-
-
-  if (result == ESP_OK) {
-
-    Serial.println("OK");
-
+  sendResultReady = false;
+  sendInProgress = true;
+  esp_err_t result = esp_now_send(
+      MASTER_MAC,
+      reinterpret_cast<const uint8_t *>(&myData),
+      sizeof(myData));
+  if (result != ESP_OK) {
+    Serial.printf("ESP-NOW send rejected on channel %u: %d\n",
+                  channel, result);
+    lastSendStatus = ESP_NOW_SEND_FAIL;
+    sendResultReady = true;
   }
-  else {
+}
 
-    Serial.println("ERROR");
-
+void processSendResult(unsigned long now) {
+  if (!sendInProgress || !sendResultReady) {
+    return;
   }
-  */
+
+  sendInProgress = false;
+  sendResultReady = false;
+
+  if (lastSendStatus == ESP_NOW_SEND_SUCCESS) {
+    consecutiveSendFailures = 0;
+    if (!masterFound) {
+      masterFound = true;
+      activeChannel = scanChannel;
+      equipment[0].lastRequest = equipment[0].currentRequest;
+      equipment[0].lastSendTime = now;
+      Serial.printf("Master found on ESP-NOW channel %u\n", activeChannel);
+    }
+    return;
+  }
+
+  if (masterFound) {
+    if (++consecutiveSendFailures >= SEND_FAILURES_BEFORE_RESCAN) {
+      masterFound = false;
+      scanChannel = FIRST_ESPNOW_CHANNEL;
+      lastChannelScanTime = now - CHANNEL_SCAN_INTERVAL_MS;
+      Serial.println("Master lost; restarting ESP-NOW channel search");
+    }
+  } else {
+    scanChannel = scanChannel >= LAST_ESPNOW_CHANNEL
+        ? FIRST_ESPNOW_CHANNEL
+        : scanChannel + 1;
+  }
 }
 
 
@@ -209,27 +224,13 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // WIFI CONFIGURATION
+  // Start Wi-Fi radio without associating to an access point.
   // ----------------------------------------------------------
 
   WiFi.mode(
       WIFI_STA
   );
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long wifiStartTime = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         (millis() - wifiStartTime) < 15000) {
-    delay(250);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Connected to %s on channel %u\n",
-                  WIFI_SSID, WiFi.channel());
-  } else {
-    Serial.println("Wi-Fi unavailable; ESP-NOW channel may not match the master");
-  }
+  Serial.println("Wi-Fi association disabled; searching ESP-NOW channels 1-11");
 
 
   // ----------------------------------------------------------
@@ -266,7 +267,7 @@ void setup() {
   );
 
 
-  // Current WiFi channel
+  // Channel zero follows the radio's selected scan channel.
   peerInfo.channel = 0;
 
   // No ESP-NOW encryption
@@ -292,17 +293,13 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // SEND INITIAL STATE FOR EACH MACHINE
-  // ----------------------------------------------------------
-
-  unsigned long now = millis();
+  // Print configured input names before starting the channel search.
   for (size_t index = 0; index < EQUIPMENT_COUNT; ++index) {
-    sendMachineState(equipment[index]);
-    equipment[index].lastSendTime = now;
     Serial.printf("Monitoring %s on pin %u\n",
                   equipment[index].name,
                   equipment[index].pin);
   }
+  lastChannelScanTime = millis() - CHANNEL_SCAN_INTERVAL_MS;
 }
 
 
@@ -311,17 +308,34 @@ void setup() {
 // ============================================================
 
 void loop() {
-    unsigned long now = millis();
+  unsigned long now = millis();
+  for (size_t index = 0; index < EQUIPMENT_COUNT; ++index) {
+    equipment[index].currentRequest = digitalRead(equipment[index].pin);
+  }
 
-    for (size_t index = 0; index < EQUIPMENT_COUNT; ++index) {
-        EquipmentInput &input = equipment[index];
-        input.currentRequest = digitalRead(input.pin);
+  processSendResult(now);
+  if (sendInProgress) {
+    return;
+  }
 
-        if (input.currentRequest != input.lastRequest ||
-                (now - input.lastSendTime) >= HEARTBEAT_INTERVAL_MS) {
-            sendMachineState(input);
-            input.lastRequest = input.currentRequest;
-            input.lastSendTime = now;
-        }
+  if (!masterFound) {
+    if (now - lastChannelScanTime >= CHANNEL_SCAN_INTERVAL_MS) {
+      lastChannelScanTime = now;
+      sendMachineState(equipment[0], scanChannel);
+      equipment[0].lastRequest = equipment[0].currentRequest;
+      equipment[0].lastSendTime = now;
     }
+    return;
+  }
+
+  for (size_t index = 0; index < EQUIPMENT_COUNT; ++index) {
+    EquipmentInput &input = equipment[index];
+    if (input.currentRequest != input.lastRequest ||
+        (now - input.lastSendTime) >= HEARTBEAT_INTERVAL_MS) {
+      sendMachineState(input, activeChannel);
+      input.lastRequest = input.currentRequest;
+      input.lastSendTime = now;
+      break;
+    }
+  }
 }

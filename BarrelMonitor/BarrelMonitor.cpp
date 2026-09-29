@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <WiFi.h>
 #include <LocalConfig.h>
 
@@ -13,6 +14,10 @@ constexpr uint8_t BARREL_TWO_XSHUT_PIN = D1;
 constexpr uint8_t FULL_ALARM_OUTPUT_PIN = D2;
 constexpr uint8_t FULL_ALARM_ACTIVE_LEVEL = HIGH;
 constexpr uint8_t FULL_ALARM_INACTIVE_LEVEL = LOW;
+constexpr uint8_t FIRST_ESPNOW_CHANNEL = 1;
+constexpr uint8_t LAST_ESPNOW_CHANNEL = 11;
+constexpr unsigned long CHANNEL_SCAN_INTERVAL_MS = 75;
+constexpr uint8_t SEND_FAILURES_BEFORE_RESCAN = 3;
 constexpr uint8_t BARREL_ONE_I2C_ADDRESS = 0x30;
 constexpr uint8_t BARREL_TWO_I2C_ADDRESS = 0x31;
 
@@ -45,6 +50,7 @@ struct Barrel {
   uint8_t confirmationReadings;
   uint8_t fillPercent;
   uint16_t distanceMm;
+  bool needsSend;
   unsigned long lastReadTime;
   unsigned long lastSendTime;
 };
@@ -55,15 +61,29 @@ Adafruit_VL53L0X barrelTwoSensor;
 Barrel barrels[] = {
   {"Barrel 1 Full", BARREL_ONE_XSHUT_PIN, BARREL_ONE_I2C_ADDRESS,
    BARREL_ONE_EMPTY_DISTANCE_MM, BARREL_ONE_FULL_DISTANCE_MM,
-   &barrelOneSensor, false, false, false, 0, 0, 0, 0, 0},
+    &barrelOneSensor, false, false, false, 0, 0, 0, 0, 0, 0},
   {"Barrel 2 Full", BARREL_TWO_XSHUT_PIN, BARREL_TWO_I2C_ADDRESS,
    BARREL_TWO_EMPTY_DISTANCE_MM, BARREL_TWO_FULL_DISTANCE_MM,
-   &barrelTwoSensor, false, false, false, 0, 0, 0, 0, 0}
+    &barrelTwoSensor, false, false, false, 0, 0, 0, 0, 0, 0}
 };
 
 constexpr size_t BARREL_COUNT = sizeof(barrels) / sizeof(barrels[0]);
 Message message;
 esp_now_peer_info_t masterPeer = {};
+  volatile bool sendResultReady = false;
+  volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_FAIL;
+  bool sendInProgress = false;
+  bool masterFound = false;
+  uint8_t scanChannel = FIRST_ESPNOW_CHANNEL;
+  uint8_t activeChannel = FIRST_ESPNOW_CHANNEL;
+  uint8_t consecutiveSendFailures = 0;
+  size_t activeBarrelIndex = 0;
+  unsigned long lastChannelScanTime = 0;
+
+void onDataSent(const uint8_t *macAddress, esp_now_send_status_t status) {
+    lastSendStatus = status;
+    sendResultReady = true;
+}
 
 uint8_t calculateFillPercent(const Barrel &barrel, uint16_t distanceMm) {
   if (distanceMm >= barrel.emptyDistanceMm) {
@@ -79,21 +99,77 @@ uint8_t calculateFillPercent(const Barrel &barrel, uint16_t distanceMm) {
 }
 
 void sendBarrelState(Barrel &barrel) {
+  barrel.needsSend = true;
+}
+
+void startBarrelSend(size_t barrelIndex, uint8_t channel) {
+  esp_err_t channelResult = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  if (channelResult != ESP_OK) {
+    Serial.printf("Failed to select ESP-NOW channel %u: %d\n",
+                  channel, channelResult);
+    lastSendStatus = ESP_NOW_SEND_FAIL;
+    sendResultReady = true;
+    sendInProgress = true;
+    activeBarrelIndex = barrelIndex;
+    return;
+  }
+
+  Barrel &barrel = barrels[barrelIndex];
   strncpy(message.device, barrel.deviceName, sizeof(message.device));
   message.device[sizeof(message.device) - 1] = '\0';
   message.request = barrel.fullAlarm;
   message.fillPercent = barrel.fillPercent;
 
+  activeBarrelIndex = barrelIndex;
+  sendResultReady = false;
+  sendInProgress = true;
   esp_err_t result = esp_now_send(
       MASTER_MAC,
       reinterpret_cast<const uint8_t *>(&message),
       sizeof(message));
-
   if (result != ESP_OK) {
-    Serial.printf("ESP-NOW send failed for %s: %d\n",
-                  barrel.deviceName, result);
+    Serial.printf("ESP-NOW send rejected for %s on channel %u: %d\n",
+                  barrel.deviceName, channel, result);
+    lastSendStatus = ESP_NOW_SEND_FAIL;
+    sendResultReady = true;
   }
-  barrel.lastSendTime = millis();
+}
+
+void processSendResult(unsigned long now) {
+  if (!sendInProgress || !sendResultReady) {
+    return;
+  }
+
+  sendInProgress = false;
+  sendResultReady = false;
+
+  if (lastSendStatus == ESP_NOW_SEND_SUCCESS) {
+    barrels[activeBarrelIndex].needsSend = false;
+    barrels[activeBarrelIndex].lastSendTime = now;
+    consecutiveSendFailures = 0;
+    if (!masterFound) {
+      masterFound = true;
+      activeChannel = scanChannel;
+      Serial.printf("Master found on ESP-NOW channel %u\n", activeChannel);
+    }
+    Serial.println("ESP-NOW delivery to master: success");
+    return;
+  }
+
+  if (masterFound) {
+    if (++consecutiveSendFailures >= SEND_FAILURES_BEFORE_RESCAN) {
+      masterFound = false;
+      scanChannel = FIRST_ESPNOW_CHANNEL;
+      Serial.println("Master lost; restarting ESP-NOW channel search");
+    }
+  } else {
+    scanChannel = scanChannel >= LAST_ESPNOW_CHANNEL
+        ? FIRST_ESPNOW_CHANNEL
+        : scanChannel + 1;
+    if (scanChannel == FIRST_ESPNOW_CHANNEL) {
+      Serial.println("Master not found on channels 1-11; restarting search");
+    }
+  }
 }
 
 bool initializeSensor(Barrel &barrel) {
@@ -145,11 +221,20 @@ void updateBarrel(Barrel &barrel, unsigned long now) {
   VL53L0X_RangingMeasurementData_t measurement;
   barrel.sensor->rangingTest(&measurement, false);
   if (measurement.RangeStatus == 4 || measurement.RangeMilliMeter == 0) {
+    Serial.printf("%s: invalid range, status %u, distance %u mm\n",
+                  barrel.deviceName,
+                  measurement.RangeStatus,
+                  measurement.RangeMilliMeter);
     return;
   }
 
   barrel.distanceMm = measurement.RangeMilliMeter;
   barrel.fillPercent = calculateFillPercent(barrel, barrel.distanceMm);
+  Serial.printf("%s: %u mm, %u%% full, range status %u\n",
+                barrel.deviceName,
+                barrel.distanceMm,
+                barrel.fillPercent,
+                measurement.RangeStatus);
 
   bool shouldBeFull = barrel.fullAlarm
       ? barrel.distanceMm <= barrel.fullDistanceMm + FULL_ALARM_HYSTERESIS_MM
@@ -177,6 +262,8 @@ void updatePhysicalAlarm() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("Barrel monitor starting");
+  Serial.println("XSHUT pins: barrel 1=D0, barrel 2=D1; I2C: SDA=D4, SCL=D5");
 
   pinMode(FULL_ALARM_OUTPUT_PIN, OUTPUT);
   digitalWrite(FULL_ALARM_OUTPUT_PIN, FULL_ALARM_INACTIVE_LEVEL);
@@ -192,30 +279,27 @@ void setup() {
   barrels[1].online = initializeSensor(barrels[1]);
 
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
-    delay(250);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Connected to Wi-Fi on channel %u\n", WiFi.channel());
-  } else {
-    Serial.println("Wi-Fi unavailable; ESP-NOW channel may not match the master");
-  }
+  Serial.println("Wi-Fi association disabled; searching ESP-NOW channels 1-11");
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW initialization failed");
     return;
   }
+  Serial.println("ESP-NOW initialized");
+  esp_now_register_send_cb(onDataSent);
 
   memcpy(masterPeer.peer_addr, MASTER_MAC, sizeof(MASTER_MAC));
   masterPeer.channel = 0;
   masterPeer.encrypt = false;
+  Serial.printf("Target master MAC: %02X:%02X:%02X:%02X:%02X:%02X; packet size: %u bytes\n",
+                MASTER_MAC[0], MASTER_MAC[1], MASTER_MAC[2],
+                MASTER_MAC[3], MASTER_MAC[4], MASTER_MAC[5],
+                static_cast<unsigned>(sizeof(message)));
   if (esp_now_add_peer(&masterPeer) != ESP_OK) {
     Serial.println("Failed to add dust collector controller as ESP-NOW peer");
     return;
   }
+  Serial.println("Dust collector controller added as ESP-NOW peer");
 
   unsigned long now = millis();
   for (size_t index = 0; index < BARREL_COUNT; ++index) {
@@ -224,6 +308,7 @@ void setup() {
       barrels[index].lastReadTime = now - SENSOR_READ_INTERVAL_MS;
     }
   }
+  lastChannelScanTime = now - CHANNEL_SCAN_INTERVAL_MS;
 }
 
 void loop() {
@@ -233,6 +318,27 @@ void loop() {
     updateBarrel(barrel, now);
     if (barrel.online && (now - barrel.lastSendTime) >= HEARTBEAT_INTERVAL_MS) {
       sendBarrelState(barrel);
+    }
+  }
+
+  processSendResult(now);
+  if (!sendInProgress) {
+    size_t pendingBarrelIndex = BARREL_COUNT;
+    for (size_t index = 0; index < BARREL_COUNT; ++index) {
+      if (barrels[index].online && barrels[index].needsSend) {
+        pendingBarrelIndex = index;
+        break;
+      }
+    }
+
+    if (pendingBarrelIndex < BARREL_COUNT &&
+        (masterFound ||
+         now - lastChannelScanTime >= CHANNEL_SCAN_INTERVAL_MS)) {
+      if (!masterFound) {
+        lastChannelScanTime = now;
+      }
+      startBarrelSend(pendingBarrelIndex,
+                      masterFound ? activeChannel : scanChannel);
     }
   }
   updatePhysicalAlarm();

@@ -208,14 +208,69 @@ void addBarrelStatus(String &page, const char *name, BarrelStatus &barrel,
   page += "</strong></p></section>";
 }
 
+void addDeviceStatus(String &page, const char *name,
+                     bool firstHasPacket, unsigned long firstPacketTime,
+                     bool secondHasPacket, unsigned long secondPacketTime,
+                     unsigned long now) {
+  bool hasPacket = firstHasPacket || secondHasPacket;
+  unsigned long packetAge = firstHasPacket ? now - firstPacketTime : 0;
+  if (secondHasPacket &&
+      (!firstHasPacket || now - secondPacketTime < packetAge)) {
+    packetAge = now - secondPacketTime;
+  }
+
+  page += "<div class='device-status'><span>";
+  page += name;
+  page += "</span><strong class='";
+  if (!hasPacket) {
+    page += "waiting'>WAITING";
+  } else if (packetAge > COMM_TIMEOUT_MS) {
+    page += "offline'>OFFLINE - last heard ";
+    page += String(packetAge / 1000);
+    page += "s ago";
+  } else {
+    page += "online'>ONLINE";
+  }
+  page += "</strong></div>";
+}
+
 void handleRoot() {
   String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   page += "<meta http-equiv='refresh' content='5'><title>Dust Collector</title>";
-  page += "<style>body{font:18px sans-serif;max-width:680px;margin:24px auto;padding:0 16px;background:#f3f5f4;color:#17221d}section{padding:12px 0;border-bottom:1px solid #bac5bf}.collector-status{padding:12px 0;font-size:20px}.barrel .full{color:#b42318}.barrel .clear{color:#176b4a}.barrel .unknown{color:#59645e}button{font-size:18px;padding:10px 24px;margin:4px;border:0;border-radius:4px;background:#176b4a;color:white}button[value=off]{background:#59645e}strong{min-width:3em;display:inline-block}</style>";
+  page += "<style>body{font:18px sans-serif;max-width:680px;margin:24px auto;padding:0 16px;background:#f3f5f4;color:#17221d}section{padding:12px 0;border-bottom:1px solid #bac5bf}.collector-status{padding:12px 0;font-size:20px}.device-status{display:flex;justify-content:space-between;gap:16px;padding:6px 0}.device-status strong{min-width:0;text-align:right}.online,.barrel .clear{color:#176b4a}.offline,.barrel .full{color:#b42318}.waiting,.barrel .unknown{color:#59645e}.barrel .clear,.barrel .full,.barrel .unknown{min-width:3em;display:inline-block}button{font-size:18px;padding:10px 24px;margin:4px;border:0;border-radius:4px;background:#176b4a;color:white}button[value=off]{background:#59645e}strong{min-width:3em;display:inline-block}</style>";
   page += "</head><body><h1>Dust Collector Controls</h1><div class='collector-status'>Dust collector status: <strong>";
   page += dustCollectorOn ? "ON" : "OFF";
   page += "</strong></div>";
   unsigned long now = millis();
+  page += "<section><h2>ESP-NOW Devices</h2><div class='device-list'>";
+  addDeviceStatus(page, "CNC Router", router.hasReceivedPacket,
+                  router.lastPacketTime, false, 0, now);
+  addDeviceStatus(page, "Table Saw + Planer", tableSaw.hasReceivedPacket,
+                  tableSaw.lastPacketTime, planer.hasReceivedPacket,
+                  planer.lastPacketTime, now);
+  addDeviceStatus(page, "Jointer", jointer.hasReceivedPacket,
+                  jointer.lastPacketTime, false, 0, now);
+  addDeviceStatus(page, "Work Table", workTable.hasReceivedPacket,
+                  workTable.lastPacketTime, false, 0, now);
+  addDeviceStatus(page, "Barrel Monitor", barrelOne.hasReceivedPacket,
+                  barrelOne.lastPacketTime, barrelTwo.hasReceivedPacket,
+                  barrelTwo.lastPacketTime, now);
+  page += "</div></section>";
+  unsigned long barrelOneAge = barrelOne.hasReceivedPacket
+      ? now - barrelOne.lastPacketTime
+      : 0;
+    unsigned long barrelTwoAge = barrelTwo.hasReceivedPacket
+      ? now - barrelTwo.lastPacketTime
+      : 0;
+    const char *barrelOneStatus = !barrelOne.hasReceivedPacket
+      ? "never"
+      : barrelOneAge > COMM_TIMEOUT_MS ? "stale" : "fresh";
+    const char *barrelTwoStatus = !barrelTwo.hasReceivedPacket
+      ? "never"
+      : barrelTwoAge > COMM_TIMEOUT_MS ? "stale" : "fresh";
+    Serial.printf("Web page requested: Barrel 1 %s, %u%%, age %lu ms; Barrel 2 %s, %u%%, age %lu ms\n",
+          barrelOneStatus, barrelOne.fillPercent, barrelOneAge,
+          barrelTwoStatus, barrelTwo.fillPercent, barrelTwoAge);
   addBarrelStatus(page, "Barrel 1", barrelOne, now);
   addBarrelStatus(page, "Barrel 2", barrelTwo, now);
   addControl(page, "CNC Router", "router", manualRouterOn, router.gateRequired);
@@ -288,6 +343,11 @@ void OnDataRecv(
 
   // Reject packet if wrong size
   if (len != sizeof(struct_message)) {
+    Serial.printf("ESP-NOW size mismatch from %02X:%02X:%02X:%02X:%02X:%02X: received %d bytes, expected %u\n",
+                  senderAddress[0], senderAddress[1], senderAddress[2],
+                  senderAddress[3], senderAddress[4], senderAddress[5],
+                  len,
+                  static_cast<unsigned>(sizeof(struct_message)));
     return;
   }
 
@@ -304,6 +364,13 @@ void OnDataRecv(
       sizeof(incomingMessage.device) - 1
   ] = '\0';
 
+  Serial.printf("ESP-NOW RX %d bytes from %02X:%02X:%02X:%02X:%02X:%02X: device='%s', request=%s, fill=%u%%\n",
+                len,
+                senderAddress[0], senderAddress[1], senderAddress[2],
+                senderAddress[3], senderAddress[4], senderAddress[5],
+                incomingMessage.device,
+                incomingMessage.request ? "ON" : "OFF",
+                incomingMessage.fillPercent);
 
   unsigned long now = millis();
 
@@ -385,6 +452,9 @@ void OnDataRecv(
         incomingMessage.request,
         now
     );
+  } else {
+    Serial.printf("ESP-NOW packet ignored: unrecognized device '%s'\n",
+                  incomingMessage.device);
   }
 }
 
@@ -656,7 +726,8 @@ void setup() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Wi-Fi channel: %u\n", WiFi.channel());
+    Serial.printf("Wi-Fi AP BSSID: %s; channel: %u\n",
+                  WiFi.BSSIDstr().c_str(), WiFi.channel());
     startWebServer();
   } else {
     Serial.println("Wi-Fi unavailable; automatic control will continue and web access will retry.");
@@ -682,6 +753,11 @@ void setup() {
   esp_now_register_recv_cb(
       OnDataRecv
   );
+  String masterMac = WiFi.macAddress();
+  Serial.printf("ESP-NOW ready; master MAC %s, channel %u, packet size %u bytes\n",
+                masterMac.c_str(),
+                WiFi.channel(),
+                static_cast<unsigned>(sizeof(struct_message)));
 
 
   Serial.println();
