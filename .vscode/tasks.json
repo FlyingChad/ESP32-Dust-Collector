@@ -1,0 +1,97 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CNCRouter: build",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "cncrouter"],
+            "problemMatcher": []
+        },
+        {
+            "label": "CNCRouter: upload and monitor",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "cncrouter", "-t", "upload", "-t", "monitor", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Table Saw + Planer: build",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "tablesawplaner"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Table Saw + Planer: upload and monitor",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "tablesawplaner", "-t", "upload", "-t", "monitor", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Jointer sender: build",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "jointer"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Jointer sender: upload and monitor",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "jointer", "-t", "upload", "-t", "monitor", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Work Table sender: build",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "worktable"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Work Table sender: upload and monitor",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "worktable", "-t", "upload", "-t", "monitor", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        },
+        {
+            "label": "DustCollector: build",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "dustcollector"],
+            "problemMatcher": []
+        },
+        {
+            "label": "DustCollector: upload and monitor",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "dustcollector", "-t", "upload", "-t", "monitor", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Barrel Monitor: build",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "barrelmonitor"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Barrel Monitor: upload and monitor",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "barrelmonitor", "-t", "upload", "-t", "monitor", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "serialPort",
+            "type": "promptString",
+            "description": "ESP32-S3 serial port, for example COM5",
+            "default": "COM5"
+        }
+    ]
+}

@@ -1,0 +1,7 @@
+.pio/
+build/
+.vscode/.cache/
+include/LocalConfig.h
+.vscode/settings.json
+.vscode/c_cpp_properties.json
+.vscode/launch.json
