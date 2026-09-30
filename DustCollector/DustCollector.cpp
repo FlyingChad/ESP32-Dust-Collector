@@ -52,6 +52,7 @@ const unsigned long GATE_CLOSE_DELAY_MS = 5000;
 // Sender sends heartbeat every 1 second.
 // Declare communication lost after 5 seconds.
 const unsigned long COMM_TIMEOUT_MS = 5000;
+constexpr uint8_t MASTER_WIFI_CHANNEL = 11;
 
 
 // ============================================================
@@ -208,6 +209,31 @@ void addBarrelStatus(String &page, const char *name, BarrelStatus &barrel,
   page += "</strong></p></section>";
 }
 
+void appendHeartbeatAge(String &page, unsigned long ageMs) {
+  unsigned long elapsedSeconds = ageMs / 1000;
+  if (elapsedSeconds < 60) {
+    page += String(elapsedSeconds);
+    page += "s";
+    return;
+  }
+
+  unsigned long elapsedMinutes = elapsedSeconds / 60;
+  if (elapsedMinutes < 60) {
+    page += String(elapsedMinutes);
+    page += "m";
+    return;
+  }
+
+  page += String(elapsedMinutes / 60);
+  page += "h";
+  unsigned long remainingMinutes = elapsedMinutes % 60;
+  if (remainingMinutes > 0) {
+    page += " ";
+    page += String(remainingMinutes);
+    page += "m";
+  }
+}
+
 void addDeviceStatus(String &page, const char *name,
                      bool firstHasPacket, unsigned long firstPacketTime,
                      bool secondHasPacket, unsigned long secondPacketTime,
@@ -224,12 +250,12 @@ void addDeviceStatus(String &page, const char *name,
   page += "</span><strong class='";
   if (!hasPacket) {
     page += "waiting'>WAITING";
-  } else if (packetAge > COMM_TIMEOUT_MS) {
-    page += "offline'>OFFLINE - last heard ";
-    page += String(packetAge / 1000);
-    page += "s ago";
-  } else {
+  } else if (packetAge <= COMM_TIMEOUT_MS) {
     page += "online'>ONLINE";
+  } else {
+    page += "offline'>OFFLINE - last heard ";
+    appendHeartbeatAge(page, packetAge);
+    page += " ago";
   }
   page += "</strong></div>";
 }
@@ -712,7 +738,7 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD, MASTER_WIFI_CHANNEL);
 
   Serial.print("Connecting to Wi-Fi: ");
   Serial.println(WIFI_SSID);
@@ -1012,6 +1038,6 @@ void loop() {
     server.handleClient();
   } else if ((now - lastWiFiAttempt) >= WIFI_RETRY_INTERVAL_MS) {
     lastWiFiAttempt = now;
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, MASTER_WIFI_CHANNEL);
   }
 }
