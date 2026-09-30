@@ -97,6 +97,9 @@ struct MachineState {
 
   // Time gate was commanded open
   unsigned long gateOpenTime;
+
+  uint64_t runtimeMs;
+  unsigned long runtimeLastUpdateTime;
 };
 
 
@@ -108,35 +111,40 @@ MachineState router = {
   false, false, 0,
   false,
   false, 0,
-  false, 0
+  false, 0,
+  0, 0
 };
 
 MachineState tableSaw = {
   false, false, 0,
   false,
   false, 0,
-  false, 0
+  false, 0,
+  0, 0
 };
 
 MachineState jointer = {
   false, false, 0,
   false,
   false, 0,
-  false, 0
+  false, 0,
+  0, 0
 };
 
 MachineState planer = {
   false, false, 0,
   false,
   false, 0,
-  false, 0
+  false, 0,
+  0, 0
 };
 
 MachineState workTable = {
   false, false, 0,
   false,
   false, 0,
-  false, 0
+  false, 0,
+  0, 0
 };
 
 struct BarrelStatus {
@@ -173,14 +181,49 @@ const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 // WEB SERVER
 // ============================================================
 
+uint64_t machineRuntimeAt(const MachineState &machine, unsigned long now) {
+  uint64_t runtimeMs = machine.runtimeMs;
+  if (machine.request && machine.runtimeLastUpdateTime != 0) {
+    runtimeMs += now - machine.runtimeLastUpdateTime;
+  }
+  return runtimeMs;
+}
+
+void updateMachineRuntime(MachineState &machine, unsigned long now) {
+  if (machine.runtimeLastUpdateTime != 0 && machine.request) {
+    machine.runtimeMs += now - machine.runtimeLastUpdateTime;
+  }
+  machine.runtimeLastUpdateTime = now;
+}
+
+String formatRuntime(uint64_t runtimeMs) {
+  uint64_t totalSeconds = runtimeMs / 1000;
+  uint64_t hours = totalSeconds / 3600;
+  uint64_t minutes = (totalSeconds / 60) % 60;
+  uint64_t seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return String(static_cast<unsigned long>(hours)) + "h " +
+           String(static_cast<unsigned long>(minutes)) + "m";
+  }
+  if (totalSeconds >= 60) {
+    return String(static_cast<unsigned long>(totalSeconds / 60)) + "m " +
+           String(static_cast<unsigned long>(seconds)) + "s";
+  }
+  return String(static_cast<unsigned long>(seconds)) + "s";
+}
+
 void addControl(String &page, const char *name, const char *device,
-                bool manualOn, bool outputOn) {
+                bool manualOn, bool outputOn, const MachineState &machine,
+                unsigned long now) {
   page += "<section><h2>";
   page += name;
   page += "</h2><p>Output: <strong>";
   page += outputOn ? "ON" : "OFF";
   page += "</strong> | Manual: <strong>";
   page += manualOn ? "ON" : "OFF";
+  page += "</strong></p><p>Runtime since boot: <strong>";
+  page += formatRuntime(machineRuntimeAt(machine, now));
   page += "</strong></p><form method='post' action='/control'>";
   page += "<input type='hidden' name='device' value='";
   page += device;
@@ -299,11 +342,16 @@ void handleRoot() {
           barrelTwoStatus, barrelTwo.fillPercent, barrelTwoAge);
   addBarrelStatus(page, "Barrel 1", barrelOne, now);
   addBarrelStatus(page, "Barrel 2", barrelTwo, now);
-  addControl(page, "CNC Router", "router", manualRouterOn, router.gateRequired);
-  addControl(page, "Table Saw", "tableSaw", manualTableSawOn, tableSaw.gateRequired);
-  addControl(page, "Jointer", "jointer", manualJointerOn, jointer.gateRequired);
-  addControl(page, "Planer", "planer", manualPlanerOn, planer.gateRequired);
-  addControl(page, "Work Table", "workTable", manualWorkTableOn, workTable.gateRequired);
+  addControl(page, "CNC Router", "router", manualRouterOn,
+             router.gateRequired, router, now);
+  addControl(page, "Table Saw", "tableSaw", manualTableSawOn,
+             tableSaw.gateRequired, tableSaw, now);
+  addControl(page, "Jointer", "jointer", manualJointerOn,
+             jointer.gateRequired, jointer, now);
+  addControl(page, "Planer", "planer", manualPlanerOn,
+             planer.gateRequired, planer, now);
+  addControl(page, "Work Table", "workTable", manualWorkTableOn,
+             workTable.gateRequired, workTable, now);
   page += "</body></html>";
   server.send(200, "text/html", page);
 }
@@ -808,6 +856,12 @@ void setup() {
 void loop() {
 
   unsigned long now = millis();
+
+  updateMachineRuntime(router, now);
+  updateMachineRuntime(tableSaw, now);
+  updateMachineRuntime(jointer, now);
+  updateMachineRuntime(planer, now);
+  updateMachineRuntime(workTable, now);
 
 
   // ==========================================================
