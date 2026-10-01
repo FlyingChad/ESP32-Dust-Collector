@@ -46,7 +46,7 @@ const unsigned long OFF_DELAY_MS = 15000;
 // Allow gate time to open before starting collector
 const unsigned long GATE_OPEN_DELAY_MS = 500;
 
-// After collector turns off, wait before closing gates
+// Keep the last open gate open while the collector spools down
 const unsigned long GATE_CLOSE_DELAY_MS = 5000;
 
 // Sender sends heartbeat every 1 second.
@@ -163,7 +163,6 @@ BarrelStatus barrelTwo = {false, 0, false, 0};
 // ============================================================
 
 bool dustCollectorOn = false;
-
 unsigned long dustCollectorOffTime = 0;
 
 WebServer server(80);
@@ -218,11 +217,17 @@ void addControl(String &page, const char *name, const char *device,
                 unsigned long now) {
   page += "<section><h2>";
   page += name;
-  page += "</h2><p>Output: <strong>";
+  page += "</h2><p>Output: <strong id='output-";
+  page += device;
+  page += "'>";
   page += outputOn ? "ON" : "OFF";
-  page += "</strong> | Manual: <strong>";
+  page += "</strong> | Manual: <strong id='manual-";
+  page += device;
+  page += "'>";
   page += manualOn ? "ON" : "OFF";
-  page += "</strong></p><p>Runtime since boot: <strong>";
+  page += "</strong></p><p>Runtime since boot: <strong id='runtime-";
+  page += device;
+  page += "'>";
   page += formatRuntime(machineRuntimeAt(machine, now));
   page += "</strong></p><form method='post' action='/control'>";
   page += "<input type='hidden' name='device' value='";
@@ -231,11 +236,13 @@ void addControl(String &page, const char *name, const char *device,
   page += "<button name='state' value='off'>OFF</button></form></section>";
 }
 
-void addBarrelStatus(String &page, const char *name, BarrelStatus &barrel,
-                     unsigned long now) {
+void addBarrelStatus(String &page, const char *name, const char *statusId,
+                     BarrelStatus &barrel, unsigned long now) {
   page += "<section class='barrel'><h2>";
   page += name;
-  page += "</h2><p>Status: <strong class='";
+  page += "</h2><p>Status: <strong id='barrel-";
+  page += statusId;
+  page += "-status' class='";
 
   if (!barrel.hasReceivedPacket ||
       (now - barrel.lastPacketTime) > COMM_TIMEOUT_MS) {
@@ -277,6 +284,67 @@ void appendHeartbeatAge(String &page, unsigned long ageMs) {
   }
 }
 
+void appendDeviceStatusJson(String &json,
+                            bool firstHasPacket, unsigned long firstPacketTime,
+                            bool secondHasPacket, unsigned long secondPacketTime,
+                            unsigned long now) {
+  bool hasPacket = firstHasPacket || secondHasPacket;
+  unsigned long packetAge = firstHasPacket ? now - firstPacketTime : 0;
+  if (secondHasPacket &&
+      (!firstHasPacket || now - secondPacketTime < packetAge)) {
+    packetAge = now - secondPacketTime;
+  }
+
+  const char *className = "waiting";
+  String status = "WAITING";
+  if (hasPacket && packetAge <= COMM_TIMEOUT_MS) {
+    className = "online";
+    status = "ONLINE";
+  } else if (hasPacket) {
+    className = "offline";
+    status = "OFFLINE - last heard ";
+    appendHeartbeatAge(status, packetAge);
+    status += " ago";
+  }
+
+  json += "{\"text\":\"";
+  json += status;
+  json += "\",\"class\":\"";
+  json += className;
+  json += "\"}";
+}
+
+void appendBarrelStatusJson(String &json, BarrelStatus &barrel,
+                            unsigned long now) {
+  const char *className = "unknown";
+  String status = "NO DATA";
+  if (barrel.hasReceivedPacket &&
+      (now - barrel.lastPacketTime) <= COMM_TIMEOUT_MS) {
+    className = barrel.full ? "full" : "clear";
+    status = String(barrel.fillPercent) + "% full";
+    if (barrel.full) {
+      status += " - FULL";
+    }
+  }
+
+  json += "{\"text\":\"";
+  json += status;
+  json += "\",\"class\":\"";
+  json += className;
+  json += "\"}";
+}
+
+void appendControlStatusJson(String &json, bool manualOn, bool outputOn,
+                             const MachineState &machine, unsigned long now) {
+  json += "{\"output\":\"";
+  json += outputOn ? "ON" : "OFF";
+  json += "\",\"manual\":\"";
+  json += manualOn ? "ON" : "OFF";
+  json += "\",\"runtime\":\"";
+  json += formatRuntime(machineRuntimeAt(machine, now));
+  json += "\"}";
+}
+
 void addDeviceStatus(String &page, const char *name,
                      bool firstHasPacket, unsigned long firstPacketTime,
                      bool secondHasPacket, unsigned long secondPacketTime,
@@ -305,9 +373,9 @@ void addDeviceStatus(String &page, const char *name,
 
 void handleRoot() {
   String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  page += "<meta http-equiv='refresh' content='5'><title>Dust Collector</title>";
+  page += "<title>Dust Collector</title>";
   page += "<style>body{font:18px sans-serif;max-width:680px;margin:24px auto;padding:0 16px;background:#f3f5f4;color:#17221d}section{padding:12px 0;border-bottom:1px solid #bac5bf}.collector-status{padding:12px 0;font-size:20px}.device-status{display:flex;justify-content:space-between;gap:16px;padding:6px 0}.device-status strong{min-width:0;text-align:right}.online,.barrel .clear{color:#176b4a}.offline,.barrel .full{color:#b42318}.waiting,.barrel .unknown{color:#59645e}.barrel .clear,.barrel .full,.barrel .unknown{min-width:3em;display:inline-block}button{font-size:18px;padding:10px 24px;margin:4px;border:0;border-radius:4px;background:#176b4a;color:white}button[value=off]{background:#59645e}strong{min-width:3em;display:inline-block}</style>";
-  page += "</head><body><h1>Dust Collector Controls</h1><div class='collector-status'>Dust collector status: <strong>";
+  page += "</head><body><h1>Dust Collector Controls</h1><div class='collector-status'>Dust collector status: <strong id='collector-status'>";
   page += dustCollectorOn ? "ON" : "OFF";
   page += "</strong></div>";
   unsigned long now = millis();
@@ -340,8 +408,8 @@ void handleRoot() {
     Serial.printf("Web page requested: Barrel 1 %s, %u%%, age %lu ms; Barrel 2 %s, %u%%, age %lu ms\n",
           barrelOneStatus, barrelOne.fillPercent, barrelOneAge,
           barrelTwoStatus, barrelTwo.fillPercent, barrelTwoAge);
-  addBarrelStatus(page, "Barrel 1", barrelOne, now);
-  addBarrelStatus(page, "Barrel 2", barrelTwo, now);
+  addBarrelStatus(page, "Barrel 1", "one", barrelOne, now);
+  addBarrelStatus(page, "Barrel 2", "two", barrelTwo, now);
   addControl(page, "CNC Router", "router", manualRouterOn,
              router.gateRequired, router, now);
   addControl(page, "Table Saw", "tableSaw", manualTableSawOn,
@@ -352,8 +420,53 @@ void handleRoot() {
              planer.gateRequired, planer, now);
   addControl(page, "Work Table", "workTable", manualWorkTableOn,
              workTable.gateRequired, workTable, now);
-  page += "</body></html>";
+  page += "<script>async function refreshStatus(){try{const response=await fetch('/status',{cache:'no-store'});if(!response.ok)return;const data=await response.json();document.getElementById('collector-status').textContent=data.collector;document.querySelectorAll('.device-status strong').forEach((node,index)=>{node.textContent=data.devices[index].text;node.className=data.devices[index].class;});document.querySelectorAll('.barrel strong').forEach((node,index)=>{node.textContent=data.barrels[index].text;node.className=data.barrels[index].class;});const devices=['router','tableSaw','jointer','planer','workTable'];data.controls.forEach((control,index)=>{document.getElementById('output-'+devices[index]).textContent=control.output;document.getElementById('manual-'+devices[index]).textContent=control.manual;document.getElementById('runtime-'+devices[index]).textContent=control.runtime;});}catch(error){}finally{setTimeout(refreshStatus,500);}}refreshStatus();</script></body></html>";
   server.send(200, "text/html", page);
+}
+
+void handleStatus() {
+  unsigned long now = millis();
+  String json;
+  json.reserve(768);
+  json += "{\"collector\":\"";
+  json += dustCollectorOn ? "ON" : "OFF";
+  json += "\",\"devices\":[";
+  appendDeviceStatusJson(json, router.hasReceivedPacket, router.lastPacketTime,
+                         false, 0, now);
+  json += ",";
+  appendDeviceStatusJson(json, tableSaw.hasReceivedPacket,
+                         tableSaw.lastPacketTime, planer.hasReceivedPacket,
+                         planer.lastPacketTime, now);
+  json += ",";
+  appendDeviceStatusJson(json, jointer.hasReceivedPacket,
+                         jointer.lastPacketTime, false, 0, now);
+  json += ",";
+  appendDeviceStatusJson(json, workTable.hasReceivedPacket,
+                         workTable.lastPacketTime, false, 0, now);
+  json += ",";
+  appendDeviceStatusJson(json, barrelOne.hasReceivedPacket,
+                         barrelOne.lastPacketTime, barrelTwo.hasReceivedPacket,
+                         barrelTwo.lastPacketTime, now);
+  json += "],\"barrels\":[";
+  appendBarrelStatusJson(json, barrelOne, now);
+  json += ",";
+  appendBarrelStatusJson(json, barrelTwo, now);
+  json += "],\"controls\":[";
+  appendControlStatusJson(json, manualRouterOn, router.gateRequired, router, now);
+  json += ",";
+  appendControlStatusJson(json, manualTableSawOn, tableSaw.gateRequired,
+                          tableSaw, now);
+  json += ",";
+  appendControlStatusJson(json, manualJointerOn, jointer.gateRequired,
+                          jointer, now);
+  json += ",";
+  appendControlStatusJson(json, manualPlanerOn, planer.gateRequired,
+                          planer, now);
+  json += ",";
+  appendControlStatusJson(json, manualWorkTableOn, workTable.gateRequired,
+                          workTable, now);
+  json += "]}";
+  server.send(200, "application/json", json);
 }
 
 void handleControl() {
@@ -383,6 +496,7 @@ void startWebServer() {
   }
 
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
   server.on("/control", HTTP_POST, handleControl);
   server.begin();
   webServerStarted = true;
@@ -628,6 +742,15 @@ bool machineNeedsExtraction(
 // SET GATE STATE
 // ============================================================
 
+bool anyOtherGateOpen(const MachineState &machine) {
+  return
+      (&machine != &router && router.gateRequired) ||
+      (&machine != &tableSaw && tableSaw.gateRequired) ||
+      (&machine != &jointer && jointer.gateRequired) ||
+      (&machine != &planer && planer.gateRequired) ||
+      (&machine != &workTable && workTable.gateRequired);
+}
+
 void updateGate(
     MachineState &machine,
     int outputPin,
@@ -658,24 +781,18 @@ void updateGate(
 
 
   // ----------------------------------------------------------
-  // CLOSING LOGIC
-  // ----------------------------------------------------------
-  //
-  // Don't close until collector has been OFF for 500 ms.
-  //
+  if (
+      machine.gateRequired &&
+      (anyOtherGateOpen(machine) ||
+       (!dustCollectorOn &&
+        (now - dustCollectorOffTime) >= GATE_CLOSE_DELAY_MS))
+  ) {
+    machine.gateRequired = false;
 
-  if (!dustCollectorOn) {
-
-    if ((now - dustCollectorOffTime)
-          >= GATE_CLOSE_DELAY_MS) {
-
-      machine.gateRequired = false;
-
-      digitalWrite(
-          outputPin,
-          OUTPUT_OFF
-      );
-    }
+    digitalWrite(
+        outputPin,
+        OUTPUT_OFF
+    );
   }
 }
 
@@ -1038,8 +1155,8 @@ void loop() {
       );
 
       dustCollectorOn = false;
-
       dustCollectorOffTime = now;
+
     }
   }
 

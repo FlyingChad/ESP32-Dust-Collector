@@ -64,6 +64,6 @@ The monitor sends both barrel percentages and full flags to the main controller 
 
 The DustCollector controller joins the configured 2.4 GHz Wi-Fi network and prints its IP address to Serial. Open that address in a browser on the same network. The page provides ON/OFF controls for the five blastgates and read-only collector status; it also shows barrel fill percentages and warnings.
 
-Manual gate requests coexist with ESP-NOW machine requests. Opening a gate waits 500 ms before starting the collector; after the collector turns off, gates wait five seconds before closing. The web UI has no separate login and is accessible to devices on the local Wi-Fi.
+Manual gate requests coexist with ESP-NOW machine requests. Opening a gate waits 500 ms before starting the collector. A gate closes when its machine's 15-second off-delay expires if another gate remains open. The last open gate stays open while the collector runs and for five seconds after it stops, allowing the collector to spool down. The web UI has no separate login and is accessible to devices on the local Wi-Fi.
 
 All ESP-NOW devices join the configured 2.4 GHz network so they follow the access point's channel. Each device reports its connected channel over Serial; verify the sender, barrel monitor, and DustCollector controller show the same channel. If a device cannot join Wi-Fi, its ESP-NOW channel may not match and communication is not guaranteed. After changing the ESP-NOW packet format, upload updated firmware to the senders, barrel monitor, and DustCollector controller.
