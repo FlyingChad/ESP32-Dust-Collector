@@ -58,7 +58,7 @@ In `BarrelMonitor/BarrelMonitor.cpp`, calibrate each barrel's empty and full sen
 
 The displayed percentage is a linear height estimate between those distances, not a calibrated volume measurement. The full alarm requires three consecutive readings at the full cutoff and clears after the measured distance increases 30 mm beyond that cutoff.
 
-The monitor sends both barrel percentages and full flags to the main controller over ESP-NOW. The web page refreshes every five seconds and shows each barrel's percentage, a full warning, or `NO DATA` when readings are stale. The barrel alarm does not command the dust collector.
+The monitor sends both barrel percentages and full flags to the main controller over ESP-NOW. The controller keeps the last received barrel levels in memory and labels them `STALE` whenever live monitor data is unavailable or timed out. Levels are not saved across controller restarts. The barrel monitor logs ESP-NOW delivery failures with the channel used to help diagnose intermittent links. The barrel alarm does not command the dust collector.
 
 ## Main Controller Web UI
 

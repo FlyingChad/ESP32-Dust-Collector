@@ -159,11 +159,12 @@ struct BarrelStatus {
   volatile bool full;
   volatile uint8_t fillPercent;
   volatile bool hasReceivedPacket;
+  volatile bool hasKnownReading;
   volatile unsigned long lastPacketTime;
 };
 
-BarrelStatus barrelOne = {false, 0, false, 0};
-BarrelStatus barrelTwo = {false, 0, false, 0};
+BarrelStatus barrelOne = {false, 0, false, false, 0};
+BarrelStatus barrelTwo = {false, 0, false, false, 0};
 
 
 // ============================================================
@@ -407,22 +408,26 @@ void addControl(String &page, const char *name, const char *device,
 
 void addBarrelStatus(String &page, const char *name, const char *statusId,
                      BarrelStatus &barrel, unsigned long now) {
+  bool readingFresh = barrel.hasReceivedPacket &&
+      (now - barrel.lastPacketTime) <=
+          timerSettings.communicationTimeoutMs;
   page += "<section class='barrel'><h2>";
   page += name;
   page += "</h2><p>Status: <strong id='barrel-";
   page += statusId;
   page += "-status' class='";
 
-  if (!barrel.hasReceivedPacket ||
-      (now - barrel.lastPacketTime) >
-          timerSettings.communicationTimeoutMs) {
+  if (!barrel.hasKnownReading) {
     page += "unknown'>NO DATA";
   } else {
-    page += barrel.full ? "full'>" : "clear'>";
+    page += barrel.full ? "full'>" : readingFresh ? "clear'>" : "stale'>";
     page += String(barrel.fillPercent);
     page += "% full";
     if (barrel.full) {
       page += " - FULL";
+    }
+    if (!readingFresh) {
+      page += " - STALE";
     }
   }
 
@@ -488,13 +493,17 @@ void appendBarrelStatusJson(String &json, BarrelStatus &barrel,
                             unsigned long now) {
   const char *className = "unknown";
   String status = "NO DATA";
-  if (barrel.hasReceivedPacket &&
+  bool readingFresh = barrel.hasReceivedPacket &&
       (now - barrel.lastPacketTime) <=
-          timerSettings.communicationTimeoutMs) {
-    className = barrel.full ? "full" : "clear";
+          timerSettings.communicationTimeoutMs;
+  if (barrel.hasKnownReading) {
+    className = barrel.full ? "full" : readingFresh ? "clear" : "stale";
     status = String(barrel.fillPercent) + "% full";
     if (barrel.full) {
       status += " - FULL";
+    }
+    if (!readingFresh) {
+      status += " - STALE";
     }
   }
 
@@ -545,7 +554,7 @@ void addDeviceStatus(String &page, const char *name,
 void handleRoot() {
   String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   page += "<title>Dust Collector</title>";
-  page += "<style>:root{color-scheme:light;--ink:#172923;--muted:#65746d;--line:#d8e1dc;--paper:#f1f5f2;--white:#fff;--green:#176b4a;--red:#b42318;--orange:#e97835}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.45 'Trebuchet MS',sans-serif}.shell{max-width:1080px;margin:0 auto;padding:28px 24px 48px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:24px 28px;margin-bottom:22px;background:#18372d;color:white;border-radius:8px;border-bottom:4px solid var(--orange)}.eyebrow,.section-label{margin:0 0 5px;color:#a8c5b7;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,4vw,34px);line-height:1.1}.collector-status{display:flex;align-items:center;gap:12px;font-size:14px;color:#d5e4dc}.collector-status strong,.state-pill{display:inline-flex;align-items:center;justify-content:center;min-width:52px;padding:4px 10px;border-radius:99px;background:#d9eee2;color:#155b3e;font-size:12px;font-weight:800;letter-spacing:.4px}.panel{margin:18px 0;padding:20px 22px;background:var(--white);border:1px solid var(--line);border-radius:8px}.panel h2,.barrel h2,.control-card h2{margin:0;font-size:18px}.panel-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.panel-title .section-label{margin:0;color:var(--muted)}.device-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:36px}.device-status{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #edf1ee}.device-status strong{min-width:0;text-align:right;font-size:12px;line-height:1.35}.online,.barrel .clear{color:var(--green)}.offline,.barrel .full{color:var(--red)}.waiting,.barrel .unknown{color:var(--muted)}.barrel-grid,.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.barrel,.control-card{min-width:0;padding:18px;background:var(--white);border:1px solid var(--line);border-radius:8px}.barrel h2{margin-bottom:10px}.barrel p{margin:0;color:var(--muted)}.barrel strong{display:block;margin-top:4px;font-size:21px}.barrel .clear,.barrel .full,.barrel .unknown{min-width:3em}.control-card{border-top:3px solid #a9c6b7}.control-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.runtime{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}.control-state{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #edf1ee;color:var(--muted);font-size:14px}.control-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}button{min-height:44px;padding:10px 16px;border:0;border-radius:4px;color:white;font:700 14px 'Trebuchet MS',sans-serif;cursor:pointer;transition:filter .15s,transform .15s}button:hover{filter:brightness(1.08)}button:active{transform:translateY(1px)}button:focus-visible{outline:3px solid var(--orange);outline-offset:2px}.open-button{background:var(--green)}.close-button{background:#59645e}strong{font-variant-numeric:tabular-nums}@media(max-width:620px){.shell{padding:14px 14px 32px}.topbar{align-items:flex-start;flex-direction:column;padding:20px}.device-list,.barrel-grid,.control-grid{grid-template-columns:1fr}.panel{padding:17px}.collector-status{width:100%;justify-content:space-between}}</style>";
+  page += "<style>:root{color-scheme:light;--ink:#172923;--muted:#65746d;--line:#d8e1dc;--paper:#f1f5f2;--white:#fff;--green:#176b4a;--red:#b42318;--orange:#e97835}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.45 'Trebuchet MS',sans-serif}.shell{max-width:1080px;margin:0 auto;padding:28px 24px 48px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:24px 28px;margin-bottom:22px;background:#18372d;color:white;border-radius:8px;border-bottom:4px solid var(--orange)}.eyebrow,.section-label{margin:0 0 5px;color:#a8c5b7;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,4vw,34px);line-height:1.1}.collector-status{display:flex;align-items:center;gap:12px;font-size:14px;color:#d5e4dc}.collector-status strong,.state-pill{display:inline-flex;align-items:center;justify-content:center;min-width:52px;padding:4px 10px;border-radius:99px;background:#d9eee2;color:#155b3e;font-size:12px;font-weight:800;letter-spacing:.4px}.panel{margin:18px 0;padding:20px 22px;background:var(--white);border:1px solid var(--line);border-radius:8px}.panel h2,.barrel h2,.control-card h2{margin:0;font-size:18px}.panel-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.panel-title .section-label{margin:0;color:var(--muted)}.device-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:36px}.device-status{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #edf1ee}.device-status strong{min-width:0;text-align:right;font-size:12px;line-height:1.35}.online,.barrel .clear{color:var(--green)}.offline,.barrel .full{color:var(--red)}.waiting,.barrel .unknown{color:var(--muted)}.barrel .stale{color:var(--orange)}.barrel-grid,.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.barrel,.control-card{min-width:0;padding:18px;background:var(--white);border:1px solid var(--line);border-radius:8px}.barrel h2{margin-bottom:10px}.barrel p{margin:0;color:var(--muted)}.barrel strong{display:block;margin-top:4px;font-size:21px}.barrel .clear,.barrel .full,.barrel .unknown,.barrel .stale{min-width:3em}.control-card{border-top:3px solid #a9c6b7}.control-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.runtime{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}.control-state{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #edf1ee;color:var(--muted);font-size:14px}.control-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}button{min-height:44px;padding:10px 16px;border:0;border-radius:4px;color:white;font:700 14px 'Trebuchet MS',sans-serif;cursor:pointer;transition:filter .15s,transform .15s}button:hover{filter:brightness(1.08)}button:active{transform:translateY(1px)}button:focus-visible{outline:3px solid var(--orange);outline-offset:2px}.open-button{background:var(--green)}.close-button{background:#59645e}strong{font-variant-numeric:tabular-nums}@media(max-width:620px){.shell{padding:14px 14px 32px}.topbar{align-items:flex-start;flex-direction:column;padding:20px}.device-list,.barrel-grid,.control-grid{grid-template-columns:1fr}.panel{padding:17px}.collector-status{width:100%;justify-content:space-between}}</style>";
   page += "<style>.barrel-grid{margin-bottom:20px}.control-actions{grid-template-columns:1fr}.toggle-button{width:100%;background:var(--green)}.toggle-button.is-on{background:#59645e}.settings-link{padding:9px 12px;border:1px solid #9bb5a7;border-radius:4px;color:white;font-weight:700;text-decoration:none;white-space:nowrap}</style>";
   page += "</head><body><main class='shell'><header class='topbar'><div><p class='eyebrow'>Shop air system</p><h1>Dust Collection</h1></div><div class='collector-status'><span>Collector</span><strong id='collector-status'>";
   page += dustCollectorOn ? "ON" : "OFF";
@@ -744,6 +753,7 @@ void OnDataRecv(
     barrelOne.fillPercent = incomingMessage.fillPercent;
     barrelOne.lastPacketTime = now;
     barrelOne.hasReceivedPacket = true;
+    barrelOne.hasKnownReading = true;
     return;
   }
 
@@ -752,6 +762,7 @@ void OnDataRecv(
     barrelTwo.fillPercent = incomingMessage.fillPercent;
     barrelTwo.lastPacketTime = now;
     barrelTwo.hasReceivedPacket = true;
+    barrelTwo.hasKnownReading = true;
     return;
   }
 

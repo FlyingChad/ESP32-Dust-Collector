@@ -78,6 +78,7 @@ esp_now_peer_info_t masterPeer = {};
   uint8_t activeChannel = FIRST_ESPNOW_CHANNEL;
   uint8_t consecutiveSendFailures = 0;
   size_t activeBarrelIndex = 0;
+  uint8_t lastAttemptChannel = FIRST_ESPNOW_CHANNEL;
   unsigned long lastChannelScanTime = 0;
 
 void onDataSent(const uint8_t *macAddress, esp_now_send_status_t status) {
@@ -103,6 +104,7 @@ void sendBarrelState(Barrel &barrel) {
 }
 
 void startBarrelSend(size_t barrelIndex, uint8_t channel) {
+  lastAttemptChannel = channel;
   esp_err_t channelResult = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
   if (channelResult != ESP_OK) {
     Serial.printf("Failed to select ESP-NOW channel %u: %d\n",
@@ -156,6 +158,8 @@ void processSendResult(unsigned long now) {
     return;
   }
 
+  Serial.printf("ESP-NOW delivery failed for %s on channel %u\n",
+                barrels[activeBarrelIndex].deviceName, lastAttemptChannel);
   if (masterFound) {
     if (++consecutiveSendFailures >= SEND_FAILURES_BEFORE_RESCAN) {
       masterFound = false;
