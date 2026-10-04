@@ -1,6 +1,8 @@
 #include <esp_now.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
+#include <stdlib.h>
 #include <LocalConfig.h>
 
 // ============================================================
@@ -40,18 +42,24 @@ const int OUTPUT_OFF = HIGH;
 // Timing
 // -------------------------
 
-// Keep extraction running after machine turns off
-const unsigned long OFF_DELAY_MS = 15000;
+struct TimerSettings {
+  uint32_t offDelayMs;
+  uint32_t gateOpenDelayMs;
+  uint32_t gateCloseDelayMs;
+  uint32_t communicationTimeoutMs;
+  uint32_t wifiRetryIntervalMs;
+  uint32_t wifiConnectTimeoutMs;
+};
 
-// Allow gate time to open before starting collector
-const unsigned long GATE_OPEN_DELAY_MS = 500;
+constexpr TimerSettings DEFAULT_TIMER_SETTINGS = {
+  15000, 500, 5000, 5000, 10000, 15000
+};
+constexpr uint32_t MAX_CONFIGURABLE_TIMER_MS = 3600000;
+constexpr uint32_t MIN_COMMUNICATION_TIMEOUT_MS = 1000;
+constexpr uint32_t MIN_WIFI_INTERVAL_MS = 1000;
+constexpr uint32_t MAX_WIFI_CONNECT_TIMEOUT_MS = 120000;
+TimerSettings timerSettings = DEFAULT_TIMER_SETTINGS;
 
-// Keep the last open gate open while the collector spools down
-const unsigned long GATE_CLOSE_DELAY_MS = 5000;
-
-// Sender sends heartbeat every 1 second.
-// Declare communication lost after 5 seconds.
-const unsigned long COMM_TIMEOUT_MS = 5000;
 constexpr uint8_t MASTER_WIFI_CHANNEL = 11;
 
 
@@ -173,12 +181,168 @@ bool manualJointerOn = false;
 bool manualPlanerOn = false;
 bool manualWorkTableOn = false;
 unsigned long lastWiFiAttempt = 0;
-const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 
 
 // ============================================================
 // WEB SERVER
 // ============================================================
+
+bool isValidTimerSettings(const TimerSettings &settings) {
+  return settings.offDelayMs <= MAX_CONFIGURABLE_TIMER_MS &&
+         settings.gateOpenDelayMs <= MAX_CONFIGURABLE_TIMER_MS &&
+         settings.gateCloseDelayMs <= MAX_CONFIGURABLE_TIMER_MS &&
+         settings.communicationTimeoutMs >= MIN_COMMUNICATION_TIMEOUT_MS &&
+         settings.communicationTimeoutMs <= MAX_CONFIGURABLE_TIMER_MS &&
+         settings.wifiRetryIntervalMs >= MIN_WIFI_INTERVAL_MS &&
+         settings.wifiRetryIntervalMs <= MAX_CONFIGURABLE_TIMER_MS &&
+         settings.wifiConnectTimeoutMs >= MIN_WIFI_INTERVAL_MS &&
+         settings.wifiConnectTimeoutMs <= MAX_WIFI_CONNECT_TIMEOUT_MS;
+}
+
+void loadTimerSettings() {
+  Preferences preferences;
+  if (!preferences.begin("dustcfg", true)) {
+    Serial.println("Unable to read timer settings; using defaults.");
+    return;
+  }
+
+  TimerSettings storedSettings = {};
+  size_t storedLength = preferences.getBytes(
+      "timers", &storedSettings, sizeof(storedSettings));
+  preferences.end();
+
+  if (storedLength == 0) {
+    Serial.println("No saved timer settings; using defaults.");
+    return;
+  }
+
+  if (storedLength != sizeof(storedSettings) ||
+      !isValidTimerSettings(storedSettings)) {
+    Serial.println("Saved timer settings are invalid; using defaults.");
+    return;
+  }
+
+  timerSettings = storedSettings;
+  Serial.println("Loaded saved timer settings.");
+}
+
+bool parseTimerValue(const char *name, uint32_t minimum, uint32_t maximum,
+                     uint32_t &value) {
+  String rawValue = server.arg(name);
+  if (rawValue.length() == 0) {
+    return false;
+  }
+
+  for (size_t index = 0; index < rawValue.length(); ++index) {
+    char character = rawValue.charAt(index);
+    if (character < '0' || character > '9') {
+      return false;
+    }
+  }
+
+  char *end = nullptr;
+  unsigned long parsedValue = strtoul(rawValue.c_str(), &end, 10);
+  if (end == rawValue.c_str() || *end != '\0' ||
+      parsedValue < minimum || parsedValue > maximum) {
+    return false;
+  }
+
+  value = static_cast<uint32_t>(parsedValue);
+  return true;
+}
+
+void addTimerField(String &page, const char *label, const char *name,
+                   uint32_t value, uint32_t minimum, uint32_t maximum) {
+  page += "<label class='field' for='";
+  page += name;
+  page += "'><span>";
+  page += label;
+  page += "</span><span class='input-row'><input id='";
+  page += name;
+  page += "' name='";
+  page += name;
+  page += "' type='number' inputmode='numeric' min='";
+  page += String(minimum);
+  page += "' max='";
+  page += String(maximum);
+  page += "' step='1' value='";
+  page += String(value);
+  page += "' required><span>ms</span></span></label>";
+}
+
+void handleTimerConfig() {
+  String page;
+  page.reserve(3600);
+  page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>Timer Settings - Dust Collector</title>";
+  page += "<style>:root{color-scheme:light;--ink:#172923;--muted:#65746d;--line:#d8e1dc;--paper:#f1f5f2;--white:#fff;--green:#176b4a;--orange:#e97835}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.45 'Trebuchet MS',sans-serif}.shell{max-width:720px;margin:0 auto;padding:28px 20px 48px}.topbar,.panel{padding:22px 24px;background:var(--white);border:1px solid var(--line);border-radius:8px}.topbar{margin-bottom:18px;background:#18372d;color:white;border-bottom:4px solid var(--orange)}h1{margin:0;font-size:clamp(24px,5vw,32px)}.topbar p{margin:5px 0 0;color:#d5e4dc}.panel h2{margin:0 0 6px;font-size:20px}.help{margin:0 0 18px;color:var(--muted)}.field{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-top:1px solid #edf1ee}.input-row{display:flex;align-items:center;gap:8px;color:var(--muted)}input{width:145px;min-height:42px;padding:8px 10px;border:1px solid #aab8b0;border-radius:4px;color:var(--ink);font:inherit}input:focus-visible,a:focus-visible,button:focus-visible{outline:3px solid var(--orange);outline-offset:2px}.actions{display:flex;align-items:center;gap:16px;margin-top:20px}button{min-height:44px;padding:10px 18px;border:0;border-radius:4px;background:var(--green);color:white;font:700 15px 'Trebuchet MS',sans-serif;cursor:pointer}a{color:var(--green);font-weight:700}.saved{padding:10px 12px;background:#e4f2e9;color:var(--green);border-radius:4px}@media(max-width:520px){.shell{padding:14px 12px 30px}.topbar,.panel{padding:18px}.field{align-items:flex-start;flex-direction:column;gap:8px}.input-row,input{width:100%}}</style>";
+  page += "</head><body><main class='shell'><header class='topbar'><h1>Timer Settings</h1><p>Adjust how long the dust collection system waits.</p></header><section class='panel'><h2>Controller timers</h2><p class='help'>Values are in milliseconds and are saved on this controller.</p>";
+  if (server.arg("saved") == "1") {
+    page += "<p class='saved' role='status'>Timer settings saved.</p>";
+  }
+  page += "<form method='post' action='/config/save'>";
+  addTimerField(page, "Machine off-delay", "offDelayMs",
+                timerSettings.offDelayMs, 0, MAX_CONFIGURABLE_TIMER_MS);
+  addTimerField(page, "Gate opening delay", "gateOpenDelayMs",
+                timerSettings.gateOpenDelayMs, 0, MAX_CONFIGURABLE_TIMER_MS);
+  addTimerField(page, "Last gate close delay", "gateCloseDelayMs",
+                timerSettings.gateCloseDelayMs, 0, MAX_CONFIGURABLE_TIMER_MS);
+  addTimerField(page, "Communication timeout", "communicationTimeoutMs",
+                timerSettings.communicationTimeoutMs,
+                MIN_COMMUNICATION_TIMEOUT_MS, MAX_CONFIGURABLE_TIMER_MS);
+  addTimerField(page, "Wi-Fi retry interval", "wifiRetryIntervalMs",
+                timerSettings.wifiRetryIntervalMs,
+                MIN_WIFI_INTERVAL_MS, MAX_CONFIGURABLE_TIMER_MS);
+  addTimerField(page, "Startup Wi-Fi connection timeout",
+                "wifiConnectTimeoutMs", timerSettings.wifiConnectTimeoutMs,
+                MIN_WIFI_INTERVAL_MS, MAX_WIFI_CONNECT_TIMEOUT_MS);
+  page += "<div class='actions'><button type='submit'>Save settings</button><a href='/'>Back to controls</a></div></form></section></main></body></html>";
+  server.send(200, "text/html", page);
+}
+
+void handleTimerConfigSave() {
+  TimerSettings updatedSettings = {};
+  if (!parseTimerValue("offDelayMs", 0, MAX_CONFIGURABLE_TIMER_MS,
+                       updatedSettings.offDelayMs) ||
+      !parseTimerValue("gateOpenDelayMs", 0, MAX_CONFIGURABLE_TIMER_MS,
+                       updatedSettings.gateOpenDelayMs) ||
+      !parseTimerValue("gateCloseDelayMs", 0, MAX_CONFIGURABLE_TIMER_MS,
+                       updatedSettings.gateCloseDelayMs) ||
+      !parseTimerValue("communicationTimeoutMs",
+                       MIN_COMMUNICATION_TIMEOUT_MS,
+                       MAX_CONFIGURABLE_TIMER_MS,
+                       updatedSettings.communicationTimeoutMs) ||
+      !parseTimerValue("wifiRetryIntervalMs", MIN_WIFI_INTERVAL_MS,
+                       MAX_CONFIGURABLE_TIMER_MS,
+                       updatedSettings.wifiRetryIntervalMs) ||
+      !parseTimerValue("wifiConnectTimeoutMs", MIN_WIFI_INTERVAL_MS,
+                       MAX_WIFI_CONNECT_TIMEOUT_MS,
+                       updatedSettings.wifiConnectTimeoutMs)) {
+    server.send(400, "text/plain",
+                "Invalid timer values. Settings were not changed.");
+    return;
+  }
+
+  Preferences preferences;
+  if (!preferences.begin("dustcfg", false)) {
+    server.send(500, "text/plain",
+                "Unable to open timer storage. Settings were not changed.");
+    return;
+  }
+
+  size_t savedLength = preferences.putBytes(
+      "timers", &updatedSettings, sizeof(updatedSettings));
+  preferences.end();
+  if (savedLength != sizeof(updatedSettings)) {
+    server.send(500, "text/plain",
+                "Unable to save timer settings. Settings were not changed.");
+    return;
+  }
+
+  timerSettings = updatedSettings;
+  server.sendHeader("Location", "/config?saved=1", true);
+  server.send(303, "text/plain", "");
+}
 
 uint64_t machineRuntimeAt(const MachineState &machine, unsigned long now) {
   uint64_t runtimeMs = machine.runtimeMs;
@@ -215,25 +379,30 @@ String formatRuntime(uint64_t runtimeMs) {
 void addControl(String &page, const char *name, const char *device,
                 bool manualOn, bool outputOn, const MachineState &machine,
                 unsigned long now) {
-  page += "<section><h2>";
+  page += "<section class='control-card'><div class='control-heading'><h2>";
   page += name;
-  page += "</h2><p>Output: <strong id='output-";
-  page += device;
-  page += "'>";
-  page += outputOn ? "ON" : "OFF";
-  page += "</strong> | Manual: <strong id='manual-";
-  page += device;
-  page += "'>";
-  page += manualOn ? "ON" : "OFF";
-  page += "</strong></p><p>Runtime since boot: <strong id='runtime-";
+  page += "</h2><span class='runtime' id='runtime-";
   page += device;
   page += "'>";
   page += formatRuntime(machineRuntimeAt(machine, now));
-  page += "</strong></p><form method='post' action='/control'>";
+  page += "</span></div><div class='control-state'><span>Gate output</span><strong class='state-pill' id='output-";
+  page += device;
+  page += "'>";
+  page += outputOn ? "ON" : "OFF";
+  page += "</strong></div><div class='control-state'><span>Manual request</span><strong class='state-pill' id='manual-";
+  page += device;
+  page += "'>";
+  page += manualOn ? "ON" : "OFF";
+  page += "</strong></div><form class='control-actions' method='post' action='/control'>";
   page += "<input type='hidden' name='device' value='";
   page += device;
-  page += "'><button name='state' value='on'>ON</button> ";
-  page += "<button name='state' value='off'>OFF</button></form></section>";
+  page += "'><button class='toggle-button";
+  page += manualOn ? " is-on" : "";
+  page += "' id='toggle-";
+  page += device;
+  page += "' name='state' value='";
+  page += manualOn ? "off'>Turn OFF" : "on'>Turn ON";
+  page += "</button></form></section>";
 }
 
 void addBarrelStatus(String &page, const char *name, const char *statusId,
@@ -245,7 +414,8 @@ void addBarrelStatus(String &page, const char *name, const char *statusId,
   page += "-status' class='";
 
   if (!barrel.hasReceivedPacket ||
-      (now - barrel.lastPacketTime) > COMM_TIMEOUT_MS) {
+      (now - barrel.lastPacketTime) >
+          timerSettings.communicationTimeoutMs) {
     page += "unknown'>NO DATA";
   } else {
     page += barrel.full ? "full'>" : "clear'>";
@@ -297,7 +467,7 @@ void appendDeviceStatusJson(String &json,
 
   const char *className = "waiting";
   String status = "WAITING";
-  if (hasPacket && packetAge <= COMM_TIMEOUT_MS) {
+  if (hasPacket && packetAge <= timerSettings.communicationTimeoutMs) {
     className = "online";
     status = "ONLINE";
   } else if (hasPacket) {
@@ -319,7 +489,8 @@ void appendBarrelStatusJson(String &json, BarrelStatus &barrel,
   const char *className = "unknown";
   String status = "NO DATA";
   if (barrel.hasReceivedPacket &&
-      (now - barrel.lastPacketTime) <= COMM_TIMEOUT_MS) {
+      (now - barrel.lastPacketTime) <=
+          timerSettings.communicationTimeoutMs) {
     className = barrel.full ? "full" : "clear";
     status = String(barrel.fillPercent) + "% full";
     if (barrel.full) {
@@ -361,7 +532,7 @@ void addDeviceStatus(String &page, const char *name,
   page += "</span><strong class='";
   if (!hasPacket) {
     page += "waiting'>WAITING";
-  } else if (packetAge <= COMM_TIMEOUT_MS) {
+  } else if (packetAge <= timerSettings.communicationTimeoutMs) {
     page += "online'>ONLINE";
   } else {
     page += "offline'>OFFLINE - last heard ";
@@ -374,12 +545,13 @@ void addDeviceStatus(String &page, const char *name,
 void handleRoot() {
   String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   page += "<title>Dust Collector</title>";
-  page += "<style>body{font:18px sans-serif;max-width:680px;margin:24px auto;padding:0 16px;background:#f3f5f4;color:#17221d}section{padding:12px 0;border-bottom:1px solid #bac5bf}.collector-status{padding:12px 0;font-size:20px}.device-status{display:flex;justify-content:space-between;gap:16px;padding:6px 0}.device-status strong{min-width:0;text-align:right}.online,.barrel .clear{color:#176b4a}.offline,.barrel .full{color:#b42318}.waiting,.barrel .unknown{color:#59645e}.barrel .clear,.barrel .full,.barrel .unknown{min-width:3em;display:inline-block}button{font-size:18px;padding:10px 24px;margin:4px;border:0;border-radius:4px;background:#176b4a;color:white}button[value=off]{background:#59645e}strong{min-width:3em;display:inline-block}</style>";
-  page += "</head><body><h1>Dust Collector Controls</h1><div class='collector-status'>Dust collector status: <strong id='collector-status'>";
+  page += "<style>:root{color-scheme:light;--ink:#172923;--muted:#65746d;--line:#d8e1dc;--paper:#f1f5f2;--white:#fff;--green:#176b4a;--red:#b42318;--orange:#e97835}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.45 'Trebuchet MS',sans-serif}.shell{max-width:1080px;margin:0 auto;padding:28px 24px 48px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:24px 28px;margin-bottom:22px;background:#18372d;color:white;border-radius:8px;border-bottom:4px solid var(--orange)}.eyebrow,.section-label{margin:0 0 5px;color:#a8c5b7;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,4vw,34px);line-height:1.1}.collector-status{display:flex;align-items:center;gap:12px;font-size:14px;color:#d5e4dc}.collector-status strong,.state-pill{display:inline-flex;align-items:center;justify-content:center;min-width:52px;padding:4px 10px;border-radius:99px;background:#d9eee2;color:#155b3e;font-size:12px;font-weight:800;letter-spacing:.4px}.panel{margin:18px 0;padding:20px 22px;background:var(--white);border:1px solid var(--line);border-radius:8px}.panel h2,.barrel h2,.control-card h2{margin:0;font-size:18px}.panel-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.panel-title .section-label{margin:0;color:var(--muted)}.device-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:36px}.device-status{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #edf1ee}.device-status strong{min-width:0;text-align:right;font-size:12px;line-height:1.35}.online,.barrel .clear{color:var(--green)}.offline,.barrel .full{color:var(--red)}.waiting,.barrel .unknown{color:var(--muted)}.barrel-grid,.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.barrel,.control-card{min-width:0;padding:18px;background:var(--white);border:1px solid var(--line);border-radius:8px}.barrel h2{margin-bottom:10px}.barrel p{margin:0;color:var(--muted)}.barrel strong{display:block;margin-top:4px;font-size:21px}.barrel .clear,.barrel .full,.barrel .unknown{min-width:3em}.control-card{border-top:3px solid #a9c6b7}.control-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.runtime{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}.control-state{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #edf1ee;color:var(--muted);font-size:14px}.control-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}button{min-height:44px;padding:10px 16px;border:0;border-radius:4px;color:white;font:700 14px 'Trebuchet MS',sans-serif;cursor:pointer;transition:filter .15s,transform .15s}button:hover{filter:brightness(1.08)}button:active{transform:translateY(1px)}button:focus-visible{outline:3px solid var(--orange);outline-offset:2px}.open-button{background:var(--green)}.close-button{background:#59645e}strong{font-variant-numeric:tabular-nums}@media(max-width:620px){.shell{padding:14px 14px 32px}.topbar{align-items:flex-start;flex-direction:column;padding:20px}.device-list,.barrel-grid,.control-grid{grid-template-columns:1fr}.panel{padding:17px}.collector-status{width:100%;justify-content:space-between}}</style>";
+  page += "<style>.barrel-grid{margin-bottom:20px}.control-actions{grid-template-columns:1fr}.toggle-button{width:100%;background:var(--green)}.toggle-button.is-on{background:#59645e}.settings-link{padding:9px 12px;border:1px solid #9bb5a7;border-radius:4px;color:white;font-weight:700;text-decoration:none;white-space:nowrap}</style>";
+  page += "</head><body><main class='shell'><header class='topbar'><div><p class='eyebrow'>Shop air system</p><h1>Dust Collection</h1></div><div class='collector-status'><span>Collector</span><strong id='collector-status'>";
   page += dustCollectorOn ? "ON" : "OFF";
-  page += "</strong></div>";
+  page += "</strong></div><a class='settings-link' href='/config'>Timer settings</a></header>";
   unsigned long now = millis();
-  page += "<section><h2>ESP-NOW Devices</h2><div class='device-list'>";
+  page += "<section class='panel'><div class='panel-title'><h2>Connected equipment</h2><p class='section-label'>ESP-NOW links</p></div><div class='device-list'>";
   addDeviceStatus(page, "CNC Router", router.hasReceivedPacket,
                   router.lastPacketTime, false, 0, now);
   addDeviceStatus(page, "Table Saw + Planer", tableSaw.hasReceivedPacket,
@@ -392,7 +564,7 @@ void handleRoot() {
   addDeviceStatus(page, "Barrel Monitor", barrelOne.hasReceivedPacket,
                   barrelOne.lastPacketTime, barrelTwo.hasReceivedPacket,
                   barrelTwo.lastPacketTime, now);
-  page += "</div></section>";
+  page += "</div></section><div class='barrel-grid'>";
   unsigned long barrelOneAge = barrelOne.hasReceivedPacket
       ? now - barrelOne.lastPacketTime
       : 0;
@@ -401,15 +573,18 @@ void handleRoot() {
       : 0;
     const char *barrelOneStatus = !barrelOne.hasReceivedPacket
       ? "never"
-      : barrelOneAge > COMM_TIMEOUT_MS ? "stale" : "fresh";
+      : barrelOneAge > timerSettings.communicationTimeoutMs
+          ? "stale" : "fresh";
     const char *barrelTwoStatus = !barrelTwo.hasReceivedPacket
       ? "never"
-      : barrelTwoAge > COMM_TIMEOUT_MS ? "stale" : "fresh";
+      : barrelTwoAge > timerSettings.communicationTimeoutMs
+          ? "stale" : "fresh";
     Serial.printf("Web page requested: Barrel 1 %s, %u%%, age %lu ms; Barrel 2 %s, %u%%, age %lu ms\n",
           barrelOneStatus, barrelOne.fillPercent, barrelOneAge,
           barrelTwoStatus, barrelTwo.fillPercent, barrelTwoAge);
   addBarrelStatus(page, "Barrel 1", "one", barrelOne, now);
   addBarrelStatus(page, "Barrel 2", "two", barrelTwo, now);
+  page += "</div><div class='control-grid'>";
   addControl(page, "CNC Router", "router", manualRouterOn,
              router.gateRequired, router, now);
   addControl(page, "Table Saw", "tableSaw", manualTableSawOn,
@@ -420,7 +595,7 @@ void handleRoot() {
              planer.gateRequired, planer, now);
   addControl(page, "Work Table", "workTable", manualWorkTableOn,
              workTable.gateRequired, workTable, now);
-  page += "<script>async function refreshStatus(){try{const response=await fetch('/status',{cache:'no-store'});if(!response.ok)return;const data=await response.json();document.getElementById('collector-status').textContent=data.collector;document.querySelectorAll('.device-status strong').forEach((node,index)=>{node.textContent=data.devices[index].text;node.className=data.devices[index].class;});document.querySelectorAll('.barrel strong').forEach((node,index)=>{node.textContent=data.barrels[index].text;node.className=data.barrels[index].class;});const devices=['router','tableSaw','jointer','planer','workTable'];data.controls.forEach((control,index)=>{document.getElementById('output-'+devices[index]).textContent=control.output;document.getElementById('manual-'+devices[index]).textContent=control.manual;document.getElementById('runtime-'+devices[index]).textContent=control.runtime;});}catch(error){}finally{setTimeout(refreshStatus,500);}}refreshStatus();</script></body></html>";
+  page += "</div></main><script>async function refreshStatus(){try{const response=await fetch('/status',{cache:'no-store'});if(!response.ok)return;const data=await response.json();document.getElementById('collector-status').textContent=data.collector;document.querySelectorAll('.device-status strong').forEach((node,index)=>{node.textContent=data.devices[index].text;node.className=data.devices[index].class;});document.querySelectorAll('.barrel strong').forEach((node,index)=>{node.textContent=data.barrels[index].text;node.className=data.barrels[index].class;});const devices=['router','tableSaw','jointer','planer','workTable'];data.controls.forEach((control,index)=>{document.getElementById('output-'+devices[index]).textContent=control.output;document.getElementById('manual-'+devices[index]).textContent=control.manual;const toggle=document.getElementById('toggle-'+devices[index]);const manualIsOn=control.manual==='ON';toggle.value=manualIsOn?'off':'on';toggle.textContent=manualIsOn?'Turn OFF':'Turn ON';toggle.classList.toggle('is-on',manualIsOn);document.getElementById('runtime-'+devices[index]).textContent=control.runtime;});}catch(error){}finally{setTimeout(refreshStatus,500);}}refreshStatus();</script></body></html>";
   server.send(200, "text/html", page);
 }
 
@@ -496,6 +671,8 @@ void startWebServer() {
   }
 
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/config", HTTP_GET, handleTimerConfig);
+  server.on("/config/save", HTTP_POST, handleTimerConfigSave);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/control", HTTP_POST, handleControl);
   server.begin();
@@ -669,7 +846,8 @@ bool machineNeedsExtraction(
   // ----------------------------------------------------------
 
   bool communicationLost =
-      (now - machine.lastPacketTime) > COMM_TIMEOUT_MS;
+      (now - machine.lastPacketTime) >
+          timerSettings.communicationTimeoutMs;
 
 
   // ----------------------------------------------------------
@@ -724,7 +902,7 @@ bool machineNeedsExtraction(
 
   if (machine.offDelayActive) {
 
-    if ((now - machine.offTime) < OFF_DELAY_MS) {
+    if ((now - machine.offTime) < timerSettings.offDelayMs) {
 
       return true;
     }
@@ -785,7 +963,8 @@ void updateGate(
       machine.gateRequired &&
       (anyOtherGateOpen(machine) ||
        (!dustCollectorOn &&
-        (now - dustCollectorOffTime) >= GATE_CLOSE_DELAY_MS))
+        (now - dustCollectorOffTime) >=
+            timerSettings.gateCloseDelayMs))
   ) {
     machine.gateRequired = false;
 
@@ -812,7 +991,7 @@ bool gateReadyForCollector(
 
   return (
     (now - machine.gateOpenTime)
-      >= GATE_OPEN_DELAY_MS
+      >= timerSettings.gateOpenDelayMs
   );
 }
 
@@ -825,6 +1004,7 @@ void setup() {
 
   // Uncomment for diagnostics
   Serial.begin(115200);
+  loadTimerSettings();
 
 
   // ----------------------------------------------------------
@@ -910,7 +1090,7 @@ void setup() {
 
   unsigned long wifiStartTime = millis();
   while (WiFi.status() != WL_CONNECTED &&
-         (millis() - wifiStartTime) < 15000) {
+         (millis() - wifiStartTime) < timerSettings.wifiConnectTimeoutMs) {
     delay(250);
     Serial.print(".");
   }
@@ -1207,7 +1387,8 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     startWebServer();
     server.handleClient();
-  } else if ((now - lastWiFiAttempt) >= WIFI_RETRY_INTERVAL_MS) {
+  } else if ((now - lastWiFiAttempt) >=
+             timerSettings.wifiRetryIntervalMs) {
     lastWiFiAttempt = now;
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD, MASTER_WIFI_CHANNEL);
   }
