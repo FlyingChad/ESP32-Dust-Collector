@@ -25,7 +25,7 @@ Build one firmware profile per board:
 | `jointer` | Jointer sender | Request input `D0` |
 | `worktable` | Work Table sender | Request input `D0` |
 | `dustcollector` | Main controller | Collector `D0`; gates `D1`–`D5` |
-| `barrelmonitor` | Two-barrel monitor | VL53L0X sensors and alarm output |
+| `barrelmonitor` | Two-barrel monitor | RCWL-1670 sensors and alarm output |
 
 For a command-line build, substitute any profile name above:
 
@@ -45,13 +45,13 @@ Equipment sender inputs use `INPUT_PULLDOWN`: a sensor must drive its input HIGH
 
 ## Barrel Monitor Wiring
 
-Use a dedicated XIAO ESP32-S3 with two VL53L0X sensors. Connect both sensors to the same I2C bus (`D4` SDA and `D5` SCL), 3.3 V, and common ground. Connect their XSHUT pins separately to `D0` and `D1`. The firmware initializes them individually and assigns addresses `0x30` and `0x31`.
+Use a dedicated XIAO ESP32-S3 with two RCWL-1670 sensors. The module's specified working voltage is 3–5 V; power each sensor from the board's 3.3 V pin and connect grounds together. Connect the sensor's `RX`/trigger pin to `D0` for barrel 1 and `D1` for barrel 2; connect its `TX`/echo pin to `D3` for barrel 1 and `D4` for barrel 2. These assignments match the XIAO ESP32-S3 barrel-monitor firmware. Operating at 3.3 V keeps the echo signal within the ESP32-S3 GPIO voltage range. Do not power a sensor at 5 V unless its echo output is level-shifted before connecting to the ESP32.
 
 The physical full-alarm signal is `D2`, active HIGH while either barrel is full. Connect it to a 3.3 V-compatible buzzer/LED driver or relay input. Do not power an alarm load directly from the ESP32 GPIO. Alarm polarity is configurable in `BarrelMonitor/BarrelMonitor.cpp`.
 
 ## Barrel Calibration and Alarms
 
-In `BarrelMonitor/BarrelMonitor.cpp`, calibrate each barrel's empty and full sensor-to-dust distances:
+In `BarrelMonitor/BarrelMonitor.cpp`, calibrate each barrel's empty and full sensor-to-dust distances. The monitor triggers each sensor every 500 ms, reads the echo pulse width, and converts it to distance. Measurements outside the RCWL-1670's specified 20–4000 mm range are rejected. Keep measurements at least 50 ms apart:
 
 - `BARREL_ONE_EMPTY_DISTANCE_MM` and `BARREL_ONE_FULL_DISTANCE_MM`
 - `BARREL_TWO_EMPTY_DISTANCE_MM` and `BARREL_TWO_FULL_DISTANCE_MM`
@@ -66,6 +66,6 @@ The DustCollector controller joins the configured 2.4 GHz Wi-Fi network and prin
 
 Manual gate requests coexist with ESP-NOW machine requests. Opening a gate waits 500 ms before starting the collector. A gate closes when its machine's 15-second off-delay expires if another gate remains open. The last open gate stays open while the collector runs and for five seconds after it stops, allowing the collector to spool down. The web UI has no separate login and is accessible to devices on the local Wi-Fi.
 
-Select **Timer settings** on the controller page to adjust the machine off-delay, gate opening and closing delays, communication timeout, startup Wi-Fi connection timeout, and Wi-Fi retry interval. Values are entered in milliseconds and saved in the controller's non-volatile storage, so they persist across restarts. The communication timeout must be at least one second; gate delays may be set to zero.
+Select **Timer settings** on the controller page to adjust the machine off-delay, gate opening and closing delays, communication timeout, startup Wi-Fi connection timeout, and Wi-Fi retry interval. The default communication timeout is 30 seconds. Values are entered in milliseconds and saved in the controller's non-volatile storage, so they persist across restarts. The communication timeout must be at least one second; gate delays may be set to zero.
 
 All ESP-NOW devices join the configured 2.4 GHz network so they follow the access point's channel. Each device reports its connected channel over Serial; verify the sender, barrel monitor, and DustCollector controller show the same channel. If a device cannot join Wi-Fi, its ESP-NOW channel may not match and communication is not guaranteed. After changing the ESP-NOW packet format, upload updated firmware to the senders, barrel monitor, and DustCollector controller.

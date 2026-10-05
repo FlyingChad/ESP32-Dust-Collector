@@ -52,7 +52,7 @@ struct TimerSettings {
 };
 
 constexpr TimerSettings DEFAULT_TIMER_SETTINGS = {
-  15000, 500, 5000, 5000, 10000, 15000
+  15000, 500, 5000, 30000, 10000, 15000
 };
 constexpr uint32_t MAX_CONFIGURABLE_TIMER_MS = 3600000;
 constexpr uint32_t MIN_COMMUNICATION_TIMEOUT_MS = 1000;

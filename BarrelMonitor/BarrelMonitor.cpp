@@ -1,6 +1,4 @@
-#include <Adafruit_VL53L0X.h>
 #include <Arduino.h>
-#include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <WiFi.h>
@@ -8,9 +6,10 @@
 
 namespace {
 
-// XIAO ESP32-S3: D4/D5 are the default SDA/SCL pins.
-constexpr uint8_t BARREL_ONE_XSHUT_PIN = D0;
-constexpr uint8_t BARREL_TWO_XSHUT_PIN = D1;
+constexpr uint8_t BARREL_ONE_TRIGGER_PIN = D0;
+constexpr uint8_t BARREL_ONE_ECHO_PIN = D3;
+constexpr uint8_t BARREL_TWO_TRIGGER_PIN = D1;
+constexpr uint8_t BARREL_TWO_ECHO_PIN = D4;
 constexpr uint8_t FULL_ALARM_OUTPUT_PIN = D2;
 constexpr uint8_t FULL_ALARM_ACTIVE_LEVEL = HIGH;
 constexpr uint8_t FULL_ALARM_INACTIVE_LEVEL = LOW;
@@ -18,8 +17,6 @@ constexpr uint8_t FIRST_ESPNOW_CHANNEL = 1;
 constexpr uint8_t LAST_ESPNOW_CHANNEL = 11;
 constexpr unsigned long CHANNEL_SCAN_INTERVAL_MS = 75;
 constexpr uint8_t SEND_FAILURES_BEFORE_RESCAN = 3;
-constexpr uint8_t BARREL_ONE_I2C_ADDRESS = 0x30;
-constexpr uint8_t BARREL_TWO_I2C_ADDRESS = 0x31;
 
 // Measure and adjust these for each installed sensor/barrel.
 constexpr uint16_t BARREL_ONE_EMPTY_DISTANCE_MM = 850;
@@ -29,7 +26,15 @@ constexpr uint16_t BARREL_TWO_FULL_DISTANCE_MM = 150;
 constexpr uint16_t FULL_ALARM_HYSTERESIS_MM = 30;
 constexpr uint8_t REQUIRED_CONFIRMATION_READINGS = 3;
 constexpr unsigned long SENSOR_READ_INTERVAL_MS = 500;
+constexpr unsigned long SENSOR_MIN_CYCLE_INTERVAL_MS = 50;
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 1000;
+constexpr unsigned long ECHO_TIMEOUT_US = 40000;
+constexpr unsigned long TRIGGER_PULSE_US = 10;
+constexpr uint16_t SENSOR_MIN_DISTANCE_MM = 20;
+constexpr uint16_t SENSOR_MAX_DISTANCE_MM = 4000;
+
+static_assert(SENSOR_READ_INTERVAL_MS >= SENSOR_MIN_CYCLE_INTERVAL_MS,
+              "RCWL-1670 measurements must be at least 50 ms apart");
 
 struct Message {
   char device[32];
@@ -39,12 +44,10 @@ struct Message {
 
 struct Barrel {
   const char *deviceName;
-  uint8_t xshutPin;
-  uint8_t i2cAddress;
+  uint8_t triggerPin;
+  uint8_t echoPin;
   uint16_t emptyDistanceMm;
   uint16_t fullDistanceMm;
-  Adafruit_VL53L0X *sensor;
-  bool online;
   bool fullAlarm;
   bool candidateFull;
   uint8_t confirmationReadings;
@@ -55,16 +58,13 @@ struct Barrel {
   unsigned long lastSendTime;
 };
 
-Adafruit_VL53L0X barrelOneSensor;
-Adafruit_VL53L0X barrelTwoSensor;
-
 Barrel barrels[] = {
-  {"Barrel 1 Full", BARREL_ONE_XSHUT_PIN, BARREL_ONE_I2C_ADDRESS,
+  {"Barrel 1 Full", BARREL_ONE_TRIGGER_PIN, BARREL_ONE_ECHO_PIN,
    BARREL_ONE_EMPTY_DISTANCE_MM, BARREL_ONE_FULL_DISTANCE_MM,
-    &barrelOneSensor, false, false, false, 0, 0, 0, 0, 0, 0},
-  {"Barrel 2 Full", BARREL_TWO_XSHUT_PIN, BARREL_TWO_I2C_ADDRESS,
+   false, false, 0, 0, 0, false, 0, 0},
+  {"Barrel 2 Full", BARREL_TWO_TRIGGER_PIN, BARREL_TWO_ECHO_PIN,
    BARREL_TWO_EMPTY_DISTANCE_MM, BARREL_TWO_FULL_DISTANCE_MM,
-    &barrelTwoSensor, false, false, false, 0, 0, 0, 0, 0, 0}
+   false, false, 0, 0, 0, false, 0, 0}
 };
 
 constexpr size_t BARREL_COUNT = sizeof(barrels) / sizeof(barrels[0]);
@@ -158,8 +158,8 @@ void processSendResult(unsigned long now) {
     return;
   }
 
-  Serial.printf("ESP-NOW delivery failed for %s on channel %u\n",
-                barrels[activeBarrelIndex].deviceName, lastAttemptChannel);
+  //Serial.printf("ESP-NOW delivery failed for %s on channel %u\n",
+  //              barrels[activeBarrelIndex].deviceName, lastAttemptChannel);
   if (masterFound) {
     if (++consecutiveSendFailures >= SEND_FAILURES_BEFORE_RESCAN) {
       masterFound = false;
@@ -174,21 +174,6 @@ void processSendResult(unsigned long now) {
       Serial.println("Master not found on channels 1-11; restarting search");
     }
   }
-}
-
-bool initializeSensor(Barrel &barrel) {
-  digitalWrite(barrel.xshutPin, HIGH);
-  delay(10);
-
-  if (!barrel.sensor->begin(0x29, false, &Wire)) {
-    Serial.printf("VL53L0X not found for %s\n", barrel.deviceName);
-    return false;
-  }
-
-  barrel.sensor->setAddress(barrel.i2cAddress);
-  Serial.printf("%s sensor ready at I2C address 0x%02X\n",
-                barrel.deviceName, barrel.i2cAddress);
-  return true;
 }
 
 void updateFullAlarm(Barrel &barrel, bool shouldBeFull) {
@@ -217,28 +202,42 @@ void updateFullAlarm(Barrel &barrel, bool shouldBeFull) {
 }
 
 void updateBarrel(Barrel &barrel, unsigned long now) {
-  if (!barrel.online || (now - barrel.lastReadTime) < SENSOR_READ_INTERVAL_MS) {
+  if ((now - barrel.lastReadTime) < SENSOR_READ_INTERVAL_MS) {
     return;
   }
   barrel.lastReadTime = now;
 
-  VL53L0X_RangingMeasurementData_t measurement;
-  barrel.sensor->rangingTest(&measurement, false);
-  if (measurement.RangeStatus == 4 || measurement.RangeMilliMeter == 0) {
-    Serial.printf("%s: invalid range, status %u, distance %u mm\n",
+  digitalWrite(barrel.triggerPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(barrel.triggerPin, HIGH);
+  delayMicroseconds(TRIGGER_PULSE_US);
+  digitalWrite(barrel.triggerPin, LOW);
+
+  unsigned long echoDurationUs = pulseIn(
+      barrel.echoPin, HIGH, ECHO_TIMEOUT_US);
+  if (echoDurationUs == 0) {
+    Serial.printf("%s: no echo within %lu ms\n",
+                  barrel.deviceName, ECHO_TIMEOUT_US / 1000);
+    return;
+  }
+  uint32_t distanceMm = (echoDurationUs * 343UL + 1000UL) / 2000UL;
+  if (distanceMm < SENSOR_MIN_DISTANCE_MM ||
+      distanceMm > SENSOR_MAX_DISTANCE_MM) {
+    Serial.printf("%s: ignoring out-of-range distance (%lu mm; valid range %u-%u mm)\n",
                   barrel.deviceName,
-                  measurement.RangeStatus,
-                  measurement.RangeMilliMeter);
+                  static_cast<unsigned long>(distanceMm),
+                  SENSOR_MIN_DISTANCE_MM,
+                  SENSOR_MAX_DISTANCE_MM);
     return;
   }
 
-  barrel.distanceMm = measurement.RangeMilliMeter;
+  barrel.distanceMm = static_cast<uint16_t>(distanceMm);
   barrel.fillPercent = calculateFillPercent(barrel, barrel.distanceMm);
-  Serial.printf("%s: %u mm, %u%% full, range status %u\n",
+  Serial.printf("%s: %u mm, %u%% full, echo %lu us\n",
                 barrel.deviceName,
                 barrel.distanceMm,
                 barrel.fillPercent,
-                measurement.RangeStatus);
+                echoDurationUs);
 
   bool shouldBeFull = barrel.fullAlarm
       ? barrel.distanceMm <= barrel.fullDistanceMm + FULL_ALARM_HYSTERESIS_MM
@@ -267,20 +266,16 @@ void updatePhysicalAlarm() {
 void setup() {
   Serial.begin(115200);
   Serial.println("Barrel monitor starting");
-  Serial.println("XSHUT pins: barrel 1=D0, barrel 2=D1; I2C: SDA=D4, SCL=D5");
+  Serial.println("RCWL-1670 trigger/echo: barrel 1 RX=D0 TX=D3; barrel 2 RX=D1 TX=D4");
 
   pinMode(FULL_ALARM_OUTPUT_PIN, OUTPUT);
   digitalWrite(FULL_ALARM_OUTPUT_PIN, FULL_ALARM_INACTIVE_LEVEL);
 
-  pinMode(BARREL_ONE_XSHUT_PIN, OUTPUT);
-  pinMode(BARREL_TWO_XSHUT_PIN, OUTPUT);
-  digitalWrite(BARREL_ONE_XSHUT_PIN, LOW);
-  digitalWrite(BARREL_TWO_XSHUT_PIN, LOW);
-  Wire.begin();
-
-  barrels[0].online = initializeSensor(barrels[0]);
-  digitalWrite(BARREL_TWO_XSHUT_PIN, LOW);
-  barrels[1].online = initializeSensor(barrels[1]);
+  for (size_t index = 0; index < BARREL_COUNT; ++index) {
+    pinMode(barrels[index].triggerPin, OUTPUT);
+    digitalWrite(barrels[index].triggerPin, LOW);
+    pinMode(barrels[index].echoPin, INPUT);
+  }
 
   WiFi.mode(WIFI_STA);
   Serial.println("Wi-Fi association disabled; searching ESP-NOW channels 1-11");
@@ -307,10 +302,8 @@ void setup() {
 
   unsigned long now = millis();
   for (size_t index = 0; index < BARREL_COUNT; ++index) {
-    if (barrels[index].online) {
-      sendBarrelState(barrels[index]);
-      barrels[index].lastReadTime = now - SENSOR_READ_INTERVAL_MS;
-    }
+    sendBarrelState(barrels[index]);
+    barrels[index].lastReadTime = now - SENSOR_READ_INTERVAL_MS;
   }
   lastChannelScanTime = now - CHANNEL_SCAN_INTERVAL_MS;
 }
@@ -320,7 +313,7 @@ void loop() {
   for (size_t index = 0; index < BARREL_COUNT; ++index) {
     Barrel &barrel = barrels[index];
     updateBarrel(barrel, now);
-    if (barrel.online && (now - barrel.lastSendTime) >= HEARTBEAT_INTERVAL_MS) {
+    if ((now - barrel.lastSendTime) >= HEARTBEAT_INTERVAL_MS) {
       sendBarrelState(barrel);
     }
   }
@@ -329,7 +322,7 @@ void loop() {
   if (!sendInProgress) {
     size_t pendingBarrelIndex = BARREL_COUNT;
     for (size_t index = 0; index < BARREL_COUNT; ++index) {
-      if (barrels[index].online && barrels[index].needsSend) {
+      if (barrels[index].needsSend) {
         pendingBarrelIndex = index;
         break;
       }
