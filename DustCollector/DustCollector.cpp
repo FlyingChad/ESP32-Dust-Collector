@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
 #include <stdlib.h>
 #include <LocalConfig.h>
 
@@ -161,10 +162,11 @@ struct BarrelStatus {
   volatile bool hasReceivedPacket;
   volatile bool hasKnownReading;
   volatile unsigned long lastPacketTime;
+  uint8_t artworkLevel;
 };
 
-BarrelStatus barrelOne = {false, 0, false, false, 0};
-BarrelStatus barrelTwo = {false, 0, false, false, 0};
+BarrelStatus barrelOne = {false, 0, false, false, 0, 0};
+BarrelStatus barrelTwo = {false, 0, false, false, 0, 0};
 
 
 // ============================================================
@@ -176,6 +178,7 @@ unsigned long dustCollectorOffTime = 0;
 
 WebServer server(80);
 bool webServerStarted = false;
+bool barrelArtworkAvailable = false;
 bool manualRouterOn = false;
 bool manualTableSawOn = false;
 bool manualJointerOn = false;
@@ -406,14 +409,51 @@ void addControl(String &page, const char *name, const char *device,
   page += "</button></form></section>";
 }
 
+uint8_t updateBarrelArtworkLevel(uint8_t fillPercent,
+                                 uint8_t currentLevel) {
+  constexpr uint8_t levels[] = {0, 25, 50, 75, 90, 100};
+  constexpr uint8_t increaseThresholds[] = {14, 39, 64, 84, 96};
+  constexpr uint8_t decreaseThresholds[] = {11, 36, 61, 81, 93};
+  constexpr size_t LEVEL_COUNT = sizeof(levels) / sizeof(levels[0]);
+
+  size_t levelIndex = 0;
+  while (levelIndex < LEVEL_COUNT && levels[levelIndex] != currentLevel) {
+    ++levelIndex;
+  }
+  if (levelIndex == LEVEL_COUNT) {
+    levelIndex = 0;
+  }
+
+  while (levelIndex + 1 < LEVEL_COUNT &&
+         fillPercent >= increaseThresholds[levelIndex]) {
+    ++levelIndex;
+  }
+  while (levelIndex > 0 &&
+         fillPercent <= decreaseThresholds[levelIndex - 1]) {
+    --levelIndex;
+  }
+  return levels[levelIndex];
+}
+
 void addBarrelStatus(String &page, const char *name, const char *statusId,
                      BarrelStatus &barrel, unsigned long now) {
   bool readingFresh = barrel.hasReceivedPacket &&
       (now - barrel.lastPacketTime) <=
           timerSettings.communicationTimeoutMs;
+  if (barrel.hasKnownReading) {
+    barrel.artworkLevel = updateBarrelArtworkLevel(
+        barrel.fillPercent, barrel.artworkLevel);
+  }
   page += "<section class='barrel'><h2>";
   page += name;
-  page += "</h2><p>Status: <strong id='barrel-";
+  page += "</h2><div id='barrel-";
+  page += statusId;
+  page += "-visual' class='barrel-visual level-";
+  page += String(barrel.artworkLevel);
+  page += "' role='img' aria-label='";
+  page += name;
+  page += barrel.hasKnownReading ? " level illustration' " : " empty barrel placeholder; no reading yet' ";
+  page += "></div><p>Status: <strong id='barrel-";
   page += statusId;
   page += "-status' class='";
 
@@ -497,6 +537,8 @@ void appendBarrelStatusJson(String &json, BarrelStatus &barrel,
       (now - barrel.lastPacketTime) <=
           timerSettings.communicationTimeoutMs;
   if (barrel.hasKnownReading) {
+    barrel.artworkLevel = updateBarrelArtworkLevel(
+        barrel.fillPercent, barrel.artworkLevel);
     className = barrel.full ? "full" : readingFresh ? "clear" : "stale";
     status = String(barrel.fillPercent) + "% full";
     if (barrel.full) {
@@ -511,7 +553,13 @@ void appendBarrelStatusJson(String &json, BarrelStatus &barrel,
   json += status;
   json += "\",\"class\":\"";
   json += className;
-  json += "\"}";
+  json += "\",\"fill\":";
+  json += String(barrel.fillPercent);
+  json += ",\"known\":";
+  json += barrel.hasKnownReading ? "true" : "false";
+  json += ",\"level\":";
+  json += String(barrel.artworkLevel);
+  json += "}";
 }
 
 void appendControlStatusJson(String &json, bool manualOn, bool outputOn,
@@ -555,7 +603,7 @@ void handleRoot() {
   String page = "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   page += "<title>Dust Collector</title>";
   page += "<style>:root{color-scheme:light;--ink:#172923;--muted:#65746d;--line:#d8e1dc;--paper:#f1f5f2;--white:#fff;--green:#176b4a;--red:#b42318;--orange:#e97835}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.45 'Trebuchet MS',sans-serif}.shell{max-width:1080px;margin:0 auto;padding:28px 24px 48px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:24px 28px;margin-bottom:22px;background:#18372d;color:white;border-radius:8px;border-bottom:4px solid var(--orange)}.eyebrow,.section-label{margin:0 0 5px;color:#a8c5b7;font-size:12px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}h1{margin:0;font-size:clamp(25px,4vw,34px);line-height:1.1}.collector-status{display:flex;align-items:center;gap:12px;font-size:14px;color:#d5e4dc}.collector-status strong,.state-pill{display:inline-flex;align-items:center;justify-content:center;min-width:52px;padding:4px 10px;border-radius:99px;background:#d9eee2;color:#155b3e;font-size:12px;font-weight:800;letter-spacing:.4px}.panel{margin:18px 0;padding:20px 22px;background:var(--white);border:1px solid var(--line);border-radius:8px}.panel h2,.barrel h2,.control-card h2{margin:0;font-size:18px}.panel-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}.panel-title .section-label{margin:0;color:var(--muted)}.device-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:36px}.device-status{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #edf1ee}.device-status strong{min-width:0;text-align:right;font-size:12px;line-height:1.35}.online,.barrel .clear{color:var(--green)}.offline,.barrel .full{color:var(--red)}.waiting,.barrel .unknown{color:var(--muted)}.barrel .stale{color:var(--orange)}.barrel-grid,.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.barrel,.control-card{min-width:0;padding:18px;background:var(--white);border:1px solid var(--line);border-radius:8px}.barrel h2{margin-bottom:10px}.barrel p{margin:0;color:var(--muted)}.barrel strong{display:block;margin-top:4px;font-size:21px}.barrel .clear,.barrel .full,.barrel .unknown,.barrel .stale{min-width:3em}.control-card{border-top:3px solid #a9c6b7}.control-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:16px}.runtime{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}.control-state{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0;border-top:1px solid #edf1ee;color:var(--muted);font-size:14px}.control-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}button{min-height:44px;padding:10px 16px;border:0;border-radius:4px;color:white;font:700 14px 'Trebuchet MS',sans-serif;cursor:pointer;transition:filter .15s,transform .15s}button:hover{filter:brightness(1.08)}button:active{transform:translateY(1px)}button:focus-visible{outline:3px solid var(--orange);outline-offset:2px}.open-button{background:var(--green)}.close-button{background:#59645e}strong{font-variant-numeric:tabular-nums}@media(max-width:620px){.shell{padding:14px 14px 32px}.topbar{align-items:flex-start;flex-direction:column;padding:20px}.device-list,.barrel-grid,.control-grid{grid-template-columns:1fr}.panel{padding:17px}.collector-status{width:100%;justify-content:space-between}}</style>";
-  page += "<style>.barrel-grid{margin-bottom:20px}.control-actions{grid-template-columns:1fr}.toggle-button{width:100%;background:var(--green)}.toggle-button.is-on{background:#59645e}.settings-link{padding:9px 12px;border:1px solid #9bb5a7;border-radius:4px;color:white;font-weight:700;text-decoration:none;white-space:nowrap}</style>";
+  page += "<style>.barrel-grid{margin-bottom:20px}.barrel-visual{width:min(100%,280px);aspect-ratio:1;margin:0 auto 12px;background-image:url('/barrel-levels.png');background-size:300% 200%;background-repeat:no-repeat}.barrel-visual[hidden]{display:none}.barrel-visual.level-0{background-position:8.98% 0}.barrel-visual.level-25{background-position:49.48% 0}.barrel-visual.level-50{background-position:90.63% 0}.barrel-visual.level-75{background-position:8.98% 97.8%}.barrel-visual.level-90{background-position:49.48% 97.8%}.barrel-visual.level-100{background-position:90.63% 97.8%}.control-actions{grid-template-columns:1fr}.toggle-button{width:100%;background:var(--green)}.toggle-button.is-on{background:#59645e}.settings-link{padding:9px 12px;border:1px solid #9bb5a7;border-radius:4px;color:white;font-weight:700;text-decoration:none;white-space:nowrap}</style>";
   page += "</head><body><main class='shell'><header class='topbar'><div><p class='eyebrow'>Shop air system</p><h1>Dust Collection</h1></div><div class='collector-status'><span>Collector</span><strong id='collector-status'>";
   page += dustCollectorOn ? "ON" : "OFF";
   page += "</strong></div><a class='settings-link' href='/config'>Timer settings</a></header>";
@@ -604,7 +652,7 @@ void handleRoot() {
              planer.gateRequired, planer, now);
   addControl(page, "Work Table", "workTable", manualWorkTableOn,
              workTable.gateRequired, workTable, now);
-  page += "</div></main><script>async function refreshStatus(){try{const response=await fetch('/status',{cache:'no-store'});if(!response.ok)return;const data=await response.json();document.getElementById('collector-status').textContent=data.collector;document.querySelectorAll('.device-status strong').forEach((node,index)=>{node.textContent=data.devices[index].text;node.className=data.devices[index].class;});document.querySelectorAll('.barrel strong').forEach((node,index)=>{node.textContent=data.barrels[index].text;node.className=data.barrels[index].class;});const devices=['router','tableSaw','jointer','planer','workTable'];data.controls.forEach((control,index)=>{document.getElementById('output-'+devices[index]).textContent=control.output;document.getElementById('manual-'+devices[index]).textContent=control.manual;const toggle=document.getElementById('toggle-'+devices[index]);const manualIsOn=control.manual==='ON';toggle.value=manualIsOn?'off':'on';toggle.textContent=manualIsOn?'Turn OFF':'Turn ON';toggle.classList.toggle('is-on',manualIsOn);document.getElementById('runtime-'+devices[index]).textContent=control.runtime;});}catch(error){}finally{setTimeout(refreshStatus,500);}}refreshStatus();</script></body></html>";
+  page += "</div></main><script>function updateBarrelVisual(index,barrel){const id=['one','two'][index];const visual=document.getElementById('barrel-'+id+'-visual');visual.className='barrel-visual level-'+barrel.level;visual.setAttribute('aria-label',barrel.known?'Barrel '+(index+1)+' level illustration, '+barrel.fill+'% full':'Barrel '+(index+1)+' empty barrel placeholder; no reading yet');}async function refreshStatus(){try{const response=await fetch('/status',{cache:'no-store'});if(!response.ok)return;const data=await response.json();document.getElementById('collector-status').textContent=data.collector;document.querySelectorAll('.device-status strong').forEach((node,index)=>{node.textContent=data.devices[index].text;node.className=data.devices[index].class;});document.querySelectorAll('.barrel strong').forEach((node,index)=>{node.textContent=data.barrels[index].text;node.className=data.barrels[index].class;updateBarrelVisual(index,data.barrels[index]);});const devices=['router','tableSaw','jointer','planer','workTable'];data.controls.forEach((control,index)=>{document.getElementById('output-'+devices[index]).textContent=control.output;document.getElementById('manual-'+devices[index]).textContent=control.manual;const toggle=document.getElementById('toggle-'+devices[index]);const manualIsOn=control.manual==='ON';toggle.value=manualIsOn?'off':'on';toggle.textContent=manualIsOn?'Turn OFF':'Turn ON';toggle.classList.toggle('is-on',manualIsOn);document.getElementById('runtime-'+devices[index]).textContent=control.runtime;});}catch(error){}finally{setTimeout(refreshStatus,500);}}refreshStatus();</script></body></html>";
   server.send(200, "text/html", page);
 }
 
@@ -679,6 +727,22 @@ void startWebServer() {
     return;
   }
 
+  server.on("/barrel-levels.png", HTTP_GET, []() {
+    if (!barrelArtworkAvailable) {
+      server.send(503, "text/plain", "Barrel artwork filesystem is unavailable");
+      return;
+    }
+
+    File artwork = SPIFFS.open("/barrel-levels.png", "r");
+    if (!artwork) {
+      Serial.println("Barrel artwork file is missing from SPIFFS");
+      server.send(404, "text/plain", "Barrel artwork file not found");
+      return;
+    }
+    server.sendHeader("Cache-Control", "no-cache");
+    server.streamFile(artwork, "image/png");
+    artwork.close();
+  });
   server.on("/", HTTP_GET, handleRoot);
   server.on("/config", HTTP_GET, handleTimerConfig);
   server.on("/config/save", HTTP_POST, handleTimerConfigSave);
@@ -1016,6 +1080,12 @@ void setup() {
   // Uncomment for diagnostics
   Serial.begin(115200);
   loadTimerSettings();
+  barrelArtworkAvailable = SPIFFS.begin(false);
+  if (barrelArtworkAvailable) {
+    Serial.println("Barrel artwork filesystem mounted");
+  } else {
+    Serial.println("Barrel artwork filesystem unavailable; upload the filesystem image");
+  }
 
 
   // ----------------------------------------------------------

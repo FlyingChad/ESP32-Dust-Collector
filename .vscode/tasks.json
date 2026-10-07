@@ -72,6 +72,13 @@
             "problemMatcher": []
         },
         {
+            "label": "DustCollector: upload filesystem",
+            "type": "shell",
+            "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
+            "args": ["run", "-e", "dustcollector", "-t", "uploadfs", "--upload-port", "${input:serialPort}"],
+            "problemMatcher": []
+        },
+        {
             "label": "Barrel Monitor: build",
             "type": "shell",
             "command": "${env:USERPROFILE}\\.platformio\\penv\\Scripts\\pio.exe",
